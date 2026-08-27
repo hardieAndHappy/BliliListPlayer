@@ -1,0 +1,17 @@
+[package]
+name = "bili-list-player"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bili_list_player_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"

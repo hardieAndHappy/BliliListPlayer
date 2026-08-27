@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口 UI webview 默认能力：授予核心命令权限；应用自定义 invoke 命令默认可调用",
+  "webviews": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

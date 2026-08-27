@@ -1,0 +1,16 @@
+node_modules/
+dist/
+target/
+.npm-cache/
+data/
+
+# 构建产物（不入库）
+release/
+src-tauri/gen/schemas/
+
+# 测试文件（不入库）
+*.test.ts
+*.test.tsx
+*.test.mjs
+tests/
+coverage/
