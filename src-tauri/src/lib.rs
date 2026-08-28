@@ -115,6 +115,7 @@ pub fn run() {
             webview::open_bilibili_webview,
             webview::navigate_bilibili_webview,
             webview::capture_list_html,
+            webview::refresh_video_title,
             webview::send_playback_command,
             webview::close_bilibili_webview,
             webview::set_bili_webview_bounds

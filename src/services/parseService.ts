@@ -32,3 +32,21 @@ export async function captureAndParse(sourceUrl: string): Promise<{ items: Parse
     invoke('capture_list_html', { sourceUrl, requestId }).catch((err) => { clearTimeout(timer); un?.(); unState?.(); reject(err); });
   });
 }
+
+/** 刷新单个视频的最新标题。在子 webview 当前页直接 fetch B 站 view API，不导航、不打断播放。
+ *  仅当子 webview 不在 bilibili 域时由 Rust 兜底导航首页。返回最新 title，失败抛错。 */
+export async function refreshVideoTitle(bvid: string): Promise<string> {
+  const requestId = crypto.randomUUID();
+  let un: UnlistenFn | undefined;
+  return new Promise((resolve, reject) => {
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => { un?.(); reject(new Error('刷新标题超时，请确认网络正常')); }, 20000);
+    listen<{ requestId: string; bvid?: string; title?: string; error?: string }>('bilibili://video-meta', (e) => {
+      if (e.payload.requestId !== requestId) return;
+      clearTimeout(timer); un?.();
+      if (e.payload.error) reject(new Error(e.payload.error));
+      else if (e.payload.title) resolve(e.payload.title);
+      else reject(new Error('未取到视频标题'));
+    }).then((u) => (un = u));
+    invoke('refresh_video_title', { bvid, requestId }).catch((err) => { clearTimeout(timer); un?.(); reject(err); });
+  });
+}

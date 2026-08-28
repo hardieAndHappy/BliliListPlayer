@@ -264,6 +264,43 @@ fn capture_script(source_url: &str, request_id: &str) -> String {
     .replace("__BILI_MEDIALIST_API__", BILI_MEDIALIST_API)
 }
 
+/// 刷新单个视频标题的注入脚本：在子 webview 当前页直接 fetch B 站单视频 view API
+/// （同域、带 cookie），取 data.title 回传。**不导航、不打断当前播放**。
+/// 仅当子 webview 不在 bilibili 域时，由 refresh_video_title 兜底导航首页后再 eval 此脚本。
+/// 只读 API 返回的 title，不读媒体流地址或 cookie（合规）。
+fn video_meta_script(bvid: &str, request_id: &str) -> String {
+    let bv = escape_js_string(bvid);
+    let req = escape_js_string(request_id);
+    r#"(function(){
+  var BVID = '__BVID__';
+  var REQ = '__REQ__';
+  function emit(event, payload){ try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: event, payload: payload }); } catch(e){} }
+  async function run(){
+    try {
+      var controller = new AbortController();
+      var timer = setTimeout(function(){ controller.abort(); }, 8000);
+      var response;
+      try {
+        response = await fetch('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(BVID), {
+          credentials: 'include', signal: controller.signal
+        });
+      } finally { clearTimeout(timer); }
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      var payload = await response.json();
+      if (payload.code !== 0 || !payload.data) throw new Error(payload.message || '视频信息接口失败');
+      var title = String((payload.data.title || '')).trim();
+      if (!title) throw new Error('视频无标题');
+      emit('bili://video-meta', { requestId: REQ, bvid: String(payload.data.bvid || BVID), title: title });
+    } catch(e) {
+      emit('bili://video-meta', { requestId: REQ, error: String(e && e.message ? e.message : e) });
+    }
+  }
+  run();
+})();"#
+    .replace("__BVID__", &bv)
+    .replace("__REQ__", &req)
+}
+
 fn playback_settings_script() -> &'static str {
     r#"(function(){
   var KEY = '__BILI_LIST_PLAYER_PLAYBACK_SETTINGS__';
@@ -552,6 +589,9 @@ pub struct CaptureState {
     pub pending_seek: Mutex<Option<f64>>,
     pub pending_play: Mutex<bool>,
     pub pending_playback_url: Mutex<Option<String>>,
+    /// 刷新单视频标题的待执行意图 (bvid, request_id)。子 webview 不在 bilibili 域时，
+    /// refresh_video_title 先导航首页，Finished 后由此消费再 eval video_meta_script。
+    pub pending_meta: Mutex<Option<(String, String)>>,
     /// 前端最近上报的播放区矩形（逻辑像素 x,y,w,h）。子 webview 尚未创建时缓存，
     /// `ensure_bili_webview` 创建后立即套用，避免 (0,0) 全窗闪现。
     pub last_bounds: Mutex<Option<(f64, f64, f64, f64)>>,
@@ -700,6 +740,16 @@ pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send 
         let _ = app_c.emit_to("main", "bilibili://parse-result", typed);
     });
 
+    // 刷新单视频标题：video_meta_script emit 的 {requestId,bvid,title?|error?} 透传到主 webview。
+    let app_m = app.clone();
+    app.listen("bili://video-meta", move |event| {
+        let value: serde_json::Value = match serde_json::from_str(event.payload()) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let _ = app_m.emit_to("main", "bilibili://video-meta", value);
+    });
+
     let app_p = app.clone();
     app.listen("bili://page-loaded", move |event| {
         let value: serde_json::Value = match serde_json::from_str(event.payload()) {
@@ -759,6 +809,18 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                     // 不匹配（about:blank / 中转风控页）→ 放回 pending，等目标列表页 Finished 再注入。
                     // 否则 about:blank 的 Finished 会消耗掉 pending，目标页加载完反而无脚本注入。
                     *state.pending_capture.lock().unwrap() = Some((src, req));
+                }
+            }
+            // 刷新标题兜底：refresh_video_title 在子 webview 不在 bilibili 域时导航首页并
+            // 暂存 (bvid, request_id)；首页 Finished（bilibili 域）即可 fetch 同域 view API，
+            // 不依赖具体页面。非 bilibili 域（about:blank/中转）则放回等下一页。
+            let pending_meta = state.pending_meta.lock().unwrap().take();
+            if let Some((bv, req)) = pending_meta {
+                let host = Url::parse(&url).ok().and_then(|u| u.host_str().map(|h| h.to_string()));
+                if host.as_deref().is_some_and(is_allowed_bili_host) {
+                    let _ = webview.eval(&video_meta_script(&bv, &req));
+                } else {
+                    *state.pending_meta.lock().unwrap() = Some((bv, req));
                 }
             }
             // 播放意图只在目标页 Finished 时消费。中间页（建子 webview 时的 BILI_HOME、
@@ -883,6 +945,47 @@ pub async fn capture_list_html(
             None => {
                 let wv = ensure_bili_webview(&app)?;
                 wv.navigate(parsed).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 刷新单个视频标题：在子 webview 当前页直接 fetch view API 取最新 title，不导航、
+/// 不打断当前播放。仅当子 webview 不存在或不在 bilibili 域时，兜底导航首页再 fetch。
+#[tauri::command]
+pub async fn refresh_video_title(
+    app: AppHandle,
+    state: State<'_, CaptureState>,
+    bvid: String,
+    request_id: String,
+) -> Result<(), String> {
+    let bv = parser::normalize_video_id(&bvid)
+        .ok_or_else(|| "无效的视频 id".to_string())?;
+    let current = state.current_url.lock().unwrap().clone();
+    let on_bili = current
+        .as_deref()
+        .and_then(|u| Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .is_some_and(|h| is_allowed_bili_host(&h));
+    match app.get_webview(BILI_LABEL) {
+        Some(wv) if on_bili => {
+            // 当前在 bilibili 域：直接 eval fetch 脚本，不导航、不打断播放。
+            wv.eval(&video_meta_script(&bv, &request_id))
+                .map_err(|e| e.to_string())?;
+        }
+        _ => {
+            // 子 webview 不存在或不在 bilibili 域：导航首页（轻量、不播视频），Finished 后兜底 fetch。
+            *state.pending_meta.lock().unwrap() = Some((bv, request_id));
+            let parsed: Url = BILI_HOME.parse().map_err(|e: url::ParseError| e.to_string())?;
+            match app.get_webview(BILI_LABEL) {
+                Some(wv) => {
+                    wv.navigate(parsed).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    let wv = ensure_bili_webview(&app)?;
+                    wv.navigate(parsed).map_err(|e| e.to_string())?;
+                }
             }
         }
     }
@@ -1100,6 +1203,20 @@ mod tests {
         assert!(!s.contains("currentSrc"));
         assert!(!s.contains("mediaUrl"));
         assert!(!s.contains("download"));
+    }
+
+    #[test]
+    fn video_meta_script_reads_only_title_and_avoids_forbidden_literals() {
+        // video_meta_script 注入到远程 B 站页，同样受合规约束：只读 view API 返回的 title，
+        // 绝不读媒体流地址或 cookie。审计禁字面量（与 capture_script 同标准）。
+        let s = video_meta_script("BV1xx", "req-42");
+        assert!(s.contains("x/web-interface/view"), "fetches single-video view API");
+        assert!(s.contains("data.title"), "reads only the title field");
+        assert!(!s.contains(".src"), "must not read media src");
+        assert!(!s.contains("currentSrc"));
+        assert!(!s.contains("mediaUrl"));
+        assert!(!s.contains("download"));
+        assert!(!s.contains("cookie"));
     }
 
     #[test]

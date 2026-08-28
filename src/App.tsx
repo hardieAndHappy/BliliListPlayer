@@ -9,7 +9,7 @@ import { nextItem, previousItem, resolvePlaybackNavigationContext } from './serv
 import { createTauriPlaybackBridge, type PlaybackCommand, type PlaybackEvent } from './services/playbackBridge';
 import { getPlaybackStartPosition, updatePlaylistItemPosition } from './services/playbackProgress';
 import { reducePlayback, type PlaybackUiState } from './services/playbackReducer';
-import { captureAndParse } from './services/parseService';
+import { captureAndParse, refreshVideoTitle } from './services/parseService';
 import { createTauriStore } from './services/playlistStore';
 import { BILIBILI_LIST_HINT, focusBilibiliWebview, navigateBilibili, openBilibiliLogin, setBilibiliBounds } from './services/webviewStore';
 import type { LocalPlaylist, ParsedItem, PlaylistDocument, PlaylistItem } from './types/playlist';
@@ -38,6 +38,8 @@ export default function App() {
   const [playback, setPlayback] = useState<PlaybackUiState>(initialPlaybackState);
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  // 正在刷新标题的视频 id 集合：刷新中按钮禁用+转圈。
+  const [refreshingIds, setRefreshingIds] = useState<Set<string>>(() => new Set());
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; playlistId: string } | null>(null);
   // 当前正在播放的视频所属列表 id（与选中列表 activePlaylistId 区分）。
   // 侧边栏据此给"正在播放"的列表加播放标记；切列表浏览时若正在播放则不隐藏 webview。
@@ -600,6 +602,26 @@ export default function App() {
     void loadAndPlay(item.url, positionSeconds);
   };
 
+  // 刷新单个视频的最新标题：在子 webview 当前页 fetch B 站 view API，不打断当前播放。
+  // 失败（断网/视频失效）notice 提示；刷新中按钮禁用。更新 active 列表里该 item 的 title。
+  const handleRefreshTitle = async (item: PlaylistItem) => {
+    const playlistId = activePlaylistId;
+    if (!playlistId) return;
+    setRefreshingIds((prev) => new Set(prev).add(item.id));
+    try {
+      const title = await refreshVideoTitle(item.id);
+      setPlaylists((value) => value.map((playlist) =>
+        playlist.id === playlistId
+          ? { ...playlist, items: playlist.items.map((it) => it.id === item.id ? { ...it, title } : it), updatedAt: new Date().toISOString() }
+          : playlist
+      ));
+    } catch (error) {
+      setNotice(`刷新标题失败：${String(error)}`);
+    } finally {
+      setRefreshingIds((prev) => { const next = new Set(prev); next.delete(item.id); return next; });
+    }
+  };
+
   const scrollToCurrentItem = () => {
     playlistScrollRef.current
       ?.querySelector<HTMLElement>('[data-current="true"]')
@@ -671,7 +693,7 @@ export default function App() {
           {notice && <div className="notice">{notice}</div>}
         </header>
         <div className="playlist-scroll" ref={playlistScrollRef}>
-          <PlaylistQueue items={items} currentItemId={currentItemId} onPlay={handlePlay} onDelete={handleDelete} />
+          <PlaylistQueue items={items} currentItemId={currentItemId} refreshingIds={refreshingIds} onPlay={handlePlay} onRefresh={handleRefreshTitle} onDelete={handleDelete} />
         </div>
         <button
           className="queue-jump-current"
