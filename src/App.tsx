@@ -21,18 +21,8 @@ const emptyPlaylist = (sourceUrl: string, name: string): LocalPlaylist => ({
 
 const initialPlaybackState: PlaybackUiState = { playing: false, currentItemId: null, positionSeconds: 0, durationSeconds: 0, error: null };
 
-const buildDocument = (
-  playlists: LocalPlaylist[], activePlaylistId: string | null, currentItemId: string | null, mode: PlaylistDocument['playlists'][number]['playback']['mode']
-): PlaylistDocument => ({
-  version: 1,
-  updatedAt: new Date().toISOString(),
-  activePlaylistId,
-  playlists: playlists.map((playlist) =>
-    playlist.id === activePlaylistId
-      ? { ...playlist, playback: { ...playlist.playback, currentItemId, mode } }
-      : playlist
-  ),
-});
+// buildDocument 移入组件（见下），以便读取 playingItemIdRef/playingPlaylistIdRef，
+// 把"正在播放列表"的 currentItemId/mode 一并落盘（而非只存 activePlaylistId 那个列表）。
 
 /** ParsedItem → PlaylistItem：补齐本地字段（位置/续播位/计数/时间）。 */
 const toPlaylistItem = (item: ParsedItem, position: number): PlaylistItem => ({
@@ -70,6 +60,8 @@ export default function App() {
     return saved > 0 ? saved : 560;
   });
   const storageReady = useRef(false);
+  // 启动恢复守卫：确保「自动恢复上次播放」只执行一次（防 React 18 严格模式 effect 双调）。
+  const restoreAttemptedRef = useRef(false);
   const bridgeRef = useRef(createTauriPlaybackBridge());
   const playerRef = useRef<HTMLElement>(null);
   const playlistScrollRef = useRef<HTMLDivElement>(null);
@@ -102,6 +94,25 @@ export default function App() {
   const items = active?.items ?? [];
   const current = useMemo(() => items.find((item) => item.id === currentItemId), [items, currentItemId]);
 
+  // 构造落盘文档：同时更新「活动列表」(activePlaylistId，侧边栏选中) 与「正在播放列表」
+  // (playingPlaylistIdRef) 的 playback.currentItemId/mode。退出时无论最后浏览哪个列表，
+  // 正在播放列表的「播到哪首 + 模式」都会落盘，重启后才能恢复上次播放。
+  // 两者同一列表时以正在播放项为准（playingItemIdRef 即真实播放项）。
+  const buildDocument = useCallback((
+    playlists: LocalPlaylist[], activePlaylistId: string | null, currentItemId: string | null, mode: PlaylistDocument['playlists'][number]['playback']['mode']
+  ): PlaylistDocument => ({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    activePlaylistId,
+    playlists: playlists.map((playlist) => {
+      const isPlaying = playlist.id === playingPlaylistIdRef.current;
+      const isActive = playlist.id === activePlaylistId;
+      if (!isPlaying && !isActive) return playlist;
+      const itemId = isPlaying ? playingItemIdRef.current : currentItemId;
+      return { ...playlist, playback: { ...playlist.playback, currentItemId: itemId ?? null, mode } };
+    }),
+  }), []);
+
   useEffect(() => {
     if (!/^已追加 \d+ 项到当前列表$/.test(notice)) return;
     const timer = window.setTimeout(() => {
@@ -113,7 +124,16 @@ export default function App() {
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
     createTauriStore().load().then((document) => {
-      if (document) { setPlaylists(document.playlists); setActivePlaylistId(document.activePlaylistId); }
+      if (document) {
+        setPlaylists(document.playlists);
+        setActivePlaylistId(document.activePlaylistId);
+        // 启动自动恢复上次播放：用刚读到的 document 直接计算目标（不依赖尚未生效的 state），
+        // 从 0 开播。失败兜底：列表没了→不播；项目没了/不可播→退到该列表第 1 首可播项。
+        if (!restoreAttemptedRef.current) {
+          restoreAttemptedRef.current = true;
+          restoreLastPlayback(document);
+        }
+      }
       storageReady.current = true;
     }).catch((error) => setNotice(`读取本地列表失败：${String(error)}`));
   }, []);
@@ -134,6 +154,31 @@ export default function App() {
     } catch (error) {
       setNotice(`播放控制失败：${String(error)}`);
     }
+  };
+
+  // 启动时从落盘文档恢复上次播放（从 0 开播）。在 load 回调里用 document 真实值计算目标，
+  // 不经 handlePlay（其闭包捕获的 activePlaylistId/playlists 此时仍是陈旧初值）。
+  // 兜底：目标列表不存在或空→不播；记录的项目不存在/不可播→退到该列表第 1 首可播项。
+  const restoreLastPlayback = (document: PlaylistDocument) => {
+    const target = document.playlists.find((p) => p.id === document.activePlaylistId) ?? null;
+    if (!target || target.items.length === 0) return;
+    const recorded = target.playback.currentItemId;
+    const item =
+      (recorded ? target.items.find((i) => i.id === recorded && i.status === 'playable') : undefined) ??
+      target.items.find((i) => i.status === 'playable');
+    if (!item) return;
+    const restoredMode = target.playback.mode;
+    setMode(restoredMode);
+    setCurrentItemId(item.id);
+    setPlayingPlaylistId(target.id);
+    setPlayback({ ...initialPlaybackState, currentItemId: item.id });
+    playingPlaylistIdRef.current = target.id;
+    playingItemIdRef.current = item.id;
+    playingModeRef.current = restoredMode;
+    autoAdvancedRef.current = false;
+    webviewVisibleRef.current = true;
+    void measureAndReportBounds();
+    void loadAndPlay(item.url, 0); // 从 0 开播
   };
 
   const goNext = (fromId: string | null = currentItemId) => {
