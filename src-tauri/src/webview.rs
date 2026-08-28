@@ -169,6 +169,23 @@ fn capture_script(source_url: &str, request_id: &str) -> String {
     var listTitle = String((state.mediaListInfo && state.mediaListInfo.title) || (playlist && playlist.title) || '');
     var isVideoPage = /\/video\//.test(new URL(SOURCE).pathname);
     if (isVideoPage) {
+      // 分P 视频（多 P 单 BV，无 ugc_season）：每个 P 没有独立 BV，?p=N 是唯一能直接播该 P
+      // 的稳定链接，即每首歌的"真实 url"。每个 ?p=N 当独立条目，播放=整页导航到 ?p=N，
+      // B 站原生即播该 P，不挂钩 B 站分P SPA 状态机。合集（ugc_season）/单视频（pages≤1）
+      // 不进此支路，fall-through 到下面已有 pod 逻辑。
+      var vd = state.videoData || {};
+      var pages = Array.isArray(vd.pages) ? vd.pages : [];
+      if (!vd.ugc_season && pages.length > 1) {
+        var bvid = String(vd.bvid || state.bvid || '');
+        listTitle = String(vd.title || listTitle || '');
+        html = pages.map(function(pg){
+          var pn = Number(pg.page) || 1;
+          var part = String(pg.part || ('P' + pn));
+          return '<a href="/video/' + encodeURIComponent(bvid) + '/?p=' + pn + '">' + escapeHtml(part) + '</a>';
+        }).join('');
+        emit('bili://capture-html', { sourceUrl: SOURCE, requestId: REQ, listTitle: listTitle, html: html });
+        return;
+      }
       var podTitle = document.querySelector('.video-pod__header .title, .video-pod__head .title, .video-pod__header .left .title');
       if (podTitle) listTitle = (podTitle.textContent || '').trim();
       var podItems = Array.from(document.querySelectorAll('.video-pod__item[data-key]'));
@@ -1268,6 +1285,21 @@ mod tests {
         assert!(s.contains("data-key"));
         assert!(s.contains("podTitle"));
         assert!(s.contains("isVideoPage"));
+    }
+
+    #[test]
+    fn capture_script_emits_multipage_p_items() {
+        // 分P 视频（无 ugc_season 且 pages>1）：每个 P 生成一条 ?p=N 独立条目。
+        let s = capture_script(
+            "https://www.bilibili.com/video/BV1NF411F7D3/?spm_id_from=333.1387.favlist",
+            "req-42",
+        );
+        assert!(s.contains("vd.pages"), "读取 videoData.pages");
+        assert!(s.contains("!vd.ugc_season"), "仅分P（非合集）走此支路");
+        assert!(s.contains("pages.length > 1"), "多 P 才进分P 支路");
+        assert!(s.contains("/?p='"), "每 P 链接带 ?p=");
+        assert!(s.contains("encodeURIComponent(bvid)"), "bvid 取自 state");
+        assert!(s.contains("pg.part"), "标题取自 page.part");
     }
 
     #[test]

@@ -109,7 +109,17 @@ pub fn parse_list_html(source_url: &str, html: &str) -> Vec<ParsedItem> {
         }
         match normalize_video_id(slug) {
             Some(id) => {
-                if !seen.insert(id.to_lowercase()) {
+                // 分P 视频：href 带 ?p=N 时，每个 P 生成独立条目（id=<BV>_p<N>，url 含 ?p=）。
+                // 无 ?p（列表/合集/单视频）→ extract_page_param 返回 None，id/url 与今天逐字一致。
+                let page = extract_page_param(&href);
+                let (item_id, url) = match page {
+                    Some(n) => (
+                        format!("{}_p{}", id, n),
+                        format!("https://www.bilibili.com/video/{}/?p={}", id, n),
+                    ),
+                    None => (id.clone(), format!("https://www.bilibili.com/video/{}", id)),
+                };
+                if !seen.insert(item_id.to_lowercase()) {
                     continue;
                 }
                 let status = if text.is_empty() {
@@ -117,9 +127,8 @@ pub fn parse_list_html(source_url: &str, html: &str) -> Vec<ParsedItem> {
                 } else {
                     ItemStatus::Playable
                 };
-                let url = format!("https://www.bilibili.com/video/{}", id);
                 items.push(ParsedItem {
-                    id,
+                    id: item_id,
                     title: text,
                     url,
                     cover_url: None,
@@ -270,6 +279,22 @@ fn resolve_url(href: &str) -> Option<(String, String)> {
     };
     let path = path.split(['?', '#']).next().unwrap_or(&path).to_string();
     Some((host.to_string(), path))
+}
+
+/// 从 href 中提取 `?p=N` / `&p=N` 页号（≥1）。按 `?`/`#`/`&` 切分查询段，仅匹配以 `p=`
+/// 开头的段，故 `spm_id_from` 等参数不会误命中。`p=0` 视为无效返回 None。无页号返回 None。
+fn extract_page_param(href: &str) -> Option<u32> {
+    for kv in href.split(['?', '#', '&']) {
+        if let Some(rest) = kv.strip_prefix("p=") {
+            let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = n.parse::<u32>() {
+                if n >= 1 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -436,5 +461,72 @@ mod tests {
         let new = vec![parsed("bv1", "a", ItemStatus::Playable)];
         let result = dedup_items(new, &["BV1".to_string()]);
         assert!(result.is_empty());
+    }
+
+    fn parsed_p(bv: &str, p: u32, title: &str, status: ItemStatus) -> ParsedItem {
+        ParsedItem {
+            id: format!("{}_p{}", bv, p),
+            title: title.to_string(),
+            url: format!("https://www.bilibili.com/video/{}/?p={}", bv, p),
+            cover_url: None,
+            author: None,
+            status,
+            duration_secs: None,
+        }
+    }
+
+    // ---- extract_page_param ----
+
+    #[test]
+    fn extract_page_param_handles_p_query() {
+        assert_eq!(extract_page_param("/video/BV1x/?p=2"), Some(2));
+        assert_eq!(extract_page_param("/video/BV1x/?p=3&spm_id_from=x"), Some(3));
+        assert_eq!(extract_page_param("/video/BV1x/?spm_id_from=x&p=4"), Some(4));
+        assert_eq!(extract_page_param("/video/BV1x/?p=2#t=5"), Some(2));
+        assert_eq!(extract_page_param("/video/BV1x"), None);
+        assert_eq!(extract_page_param("/video/BV1x/?p=0"), None);
+        assert_eq!(extract_page_param("/video/BV1x/?p="), None);
+        // 非法前缀不误命中
+        assert_eq!(extract_page_param("/video/BV1x/?xp=2"), None);
+        assert_eq!(extract_page_param("/video/BV1x/?spm_id_from=333"), None);
+    }
+
+    // ---- parse_list_html: 分P (?p=N) ----
+
+    #[test]
+    fn parse_list_html_extracts_multipage_p_items() {
+        let html = r#"<a href="/video/BV1x/?p=2">P2</a><a href="/video/BV1x/?p=3">P3</a>"#;
+        let items = parse_list_html("https://www.bilibili.com/video/BV1x", html);
+        assert_eq!(
+            items,
+            vec![
+                parsed_p("BV1x", 2, "P2", ItemStatus::Playable),
+                parsed_p("BV1x", 3, "P3", ItemStatus::Playable),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_list_html_multipage_p_pending_when_no_title() {
+        let html = r#"<a href="/video/BV1x/?p=2"></a>"#;
+        let items = parse_list_html("https://www.bilibili.com/video/BV1x", html);
+        assert_eq!(items, vec![parsed_p("BV1x", 2, "", ItemStatus::Pending)]);
+    }
+
+    #[test]
+    fn parse_list_html_dedup_multipage_p() {
+        let html = r#"<a href="/video/BV1x/?p=2">P2</a><a href="/video/BV1x/?p=2">dup</a>"#;
+        let items = parse_list_html("https://www.bilibili.com/video/BV1x", html);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "BV1x_p2");
+    }
+
+    #[test]
+    fn parse_list_html_plain_video_unchanged_without_p() {
+        // 回归保护：无 ?p 的普通视频 href 仍走原路径，id/url 不变。
+        let html = r#"<a href="/video/BV1x">t</a>"#;
+        let items = parse_list_html("https://www.bilibili.com/video/BV1x", html);
+        assert_eq!(items, vec![parsed("BV1x", "t", ItemStatus::Playable)]);
+        assert!(!items[0].url.contains("?p="));
     }
 }
