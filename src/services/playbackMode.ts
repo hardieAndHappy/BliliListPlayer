@@ -34,10 +34,12 @@ export function nextItem(items: PlaylistItem[], currentId: string | null, mode: 
   const currentIndex = playable.findIndex((item) => item.id === currentId);
   if (mode === 'single-loop' && currentId && currentIndex >= 0) return { itemId: currentId, round };
   if (mode === 'random') {
-    const remaining = playable.map((item) => item.id).filter((id) => id !== currentId && !round.includes(id));
-    if (!remaining.length) return nextItem(playable, null, 'random', [], randomSeed + 1);
-    const index = Math.abs(randomSeed + round.length) % remaining.length;
-    const itemId = remaining[index];
+    // 真随机：Math.random() 等概率抽一首，允许连播同一首。round/randomSeed 仅为兼容旧调用签名
+    // 保留（落盘的死字段），不再参与选曲——旧实现用确定性偏移 (randomSeed+round.length)%N，
+    // 既不随机、round 不重复逻辑也因调用方从不传参而从未生效。
+    const pool = playable.map((item) => item.id).filter((id) => id !== currentId);
+    if (!pool.length) return { itemId: currentId, round };
+    const itemId = pool[Math.floor(Math.random() * pool.length)];
     return { itemId, round: [...round, itemId] };
   }
   const nextIndex = currentIndex < 0 ? 0 : currentIndex + 1;
@@ -53,10 +55,10 @@ export function previousItem(items: PlaylistItem[], currentId: string | null, mo
   const currentIndex = playable.findIndex((item) => item.id === currentId);
   if (mode === 'single-loop' && currentId && currentIndex >= 0) return { itemId: currentId, round };
   if (mode === 'random') {
-    const remaining = playable.map((item) => item.id).filter((id) => id !== currentId && !round.includes(id));
-    if (!remaining.length) return previousItem(playable, null, 'random', [], randomSeed + 1);
-    const index = Math.abs(randomSeed + round.length) % remaining.length;
-    const itemId = remaining[index];
+    // 真随机（与 nextItem 同）：等概率抽一首，允许连播同一首。
+    const pool = playable.map((item) => item.id).filter((id) => id !== currentId);
+    if (!pool.length) return { itemId: currentId, round };
+    const itemId = pool[Math.floor(Math.random() * pool.length)];
     return { itemId, round: [...round, itemId] };
   }
   const prevIndex = currentIndex < 0 ? playable.length - 1 : currentIndex - 1;
