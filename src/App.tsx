@@ -281,6 +281,18 @@ export default function App() {
     return () => { unsubscribe?.(); };
   }, []);
 
+  // 诊断：子 webview 注入脚本经 dbg() 上报的播放控制流程，打到主 devtools 控制台。
+  // 修复「双击/自动切歌不自动开播、进度条灰色」时用于定位；问题解决后可移除。
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let unsubscribe: UnlistenFn | undefined;
+    listen<{ msg: string }>('bilibili://debug', (event) => {
+      // eslint-disable-next-line no-console
+      console.warn('[bili-ctrl]', event.payload.msg);
+    }).then((un) => { unsubscribe = un; });
+    return () => { unsubscribe?.(); };
+  }, []);
+
   // 播放区矩形上报：挂载即测 + 元素尺寸变化（ResizeObserver）+ 窗口缩放触发重测。
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;

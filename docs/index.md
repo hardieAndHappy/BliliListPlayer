@@ -93,7 +93,7 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 `App.importList` → 前端预检 → `navigateBilibili` → `captureAndParse`(invoke `capture_list_html`) → Rust 注入 `capture_script` 到 B 站页 → 脚本抓 `__INITIAL_STATE__` + 分页 API → emit `bili://capture-html` → Rust `register` 路由 → `parser::parse_list_html` → emit `bilibili://parse-result` → 前端落库 → `save_playlists`。
 
 **播放数据流**：
-`App.handlePlay` → `sendCommand({load})`+`{play}` → invoke `send_playback_command`（load=navigate+pending_seek+pending_playback_url，play 置 pending_play）→ 目标页 `Finished` 且 `same_list_page` 匹配（忽略 query/尾斜杠）后 eval `seek_and_play_control_script`（轮询等 `<video>`→seek→play，带静音降级）→ B 站页 `<video>` 事件 → emit `bili://video-event` → Rust `map_video_event` 规范化 → emit `bilibili://playback-event` → `playbackReducer` → UI。上一曲/下一曲及自动切歌固定使用开始播放时的列表上下文；切换侧边栏浏览其他列表不会改变实际播放列表的导航范围。
+`App.handlePlay` → `sendCommand({load})`+`{play}` → invoke `send_playback_command`（load=navigate+pending_seek+pending_playback_url，play 置 pending_play）→ 目标页 `Finished` 且 `same_list_page` 匹配（忽略 query/尾斜杠）后 eval `seek_and_play_control_script`（轮询等真正 `<video>`——跳过 `bwp-video` 自定义元素——→seek→play；`readyState<1` 时点 B 站播放按钮触发其拉流设 src，再 `oncePlay` 带 allowance 过守卫 + 静音降级）→ B 站页 `<video>` 事件 → emit `bili://video-event` → Rust `map_video_event` 规范化 → emit `bilibili://playback-event` → `playbackReducer` → UI。上一曲/下一曲及自动切歌固定使用开始播放时的列表上下文；切换侧边栏浏览其他列表不会改变实际播放列表的导航范围。
 
 ## 4. UI 结构
 
@@ -134,12 +134,12 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 | `same_list_page`（host+path 忽略 query 与尾斜杠） | [webview.rs:42](../src-tauri/src/webview.rs#L42) |
 | `BRIDGE_INIT` 注入脚本（hook `<video>` 事件） | [webview.rs:58](../src-tauri/src/webview.rs#L58) |
 | `capture_script`（抓 `__INITIAL_STATE__`+分页+`listTitle`） | [webview.rs:132](../src-tauri/src/webview.rs#L132) |
-| `PLAY_CONTROL_HELPERS`（轮询 `<video>` + 静音降级播放） | [webview.rs:343](../src-tauri/src/webview.rs#L343) |
-| `control_script`（play/pause/seek，轮询等 `<video>`） | [webview.rs:365](../src-tauri/src/webview.rs#L365) |
-| `seek_and_play_control_script`（Load 流程合并 seek+play） | [webview.rs:384](../src-tauri/src/webview.rs#L384) |
-| 视频事件校验 `validate_video_event_payload` | [webview.rs:408](../src-tauri/src/webview.rs#L408) |
-| 视频事件规范化 `map_video_event` | [webview.rs:470](../src-tauri/src/webview.rs#L470) |
-| 事件路由 `register`（3 个 bili:// 监听） | [webview.rs:516](../src-tauri/src/webview.rs#L516) |
+| `PLAY_CONTROL_HELPERS`（控制只选真正 `<video>`、跳过 `bwp-video` 自定义元素 + `readyState<1` 点 B 站按钮触发拉流 + 静音降级 + seekTo + `dbg` 诊断） | [webview.rs:352](../src-tauri/src/webview.rs#L352) |
+| `control_script`（play/pause/seek，轮询等 `<video>`） | [webview.rs:467](../src-tauri/src/webview.rs#L467) |
+| `seek_and_play_control_script`（Load 流程合并 seek+play） | [webview.rs:487](../src-tauri/src/webview.rs#L487) |
+| 视频事件校验 `validate_video_event_payload` | [webview.rs:425](../src-tauri/src/webview.rs#L425) |
+| 视频事件规范化 `map_video_event` | [webview.rs:573](../src-tauri/src/webview.rs#L573) |
+| 事件路由 `register`（4 个 bili:// 监听，含 debug 诊断转发） | [webview.rs:619](../src-tauri/src/webview.rs#L619) |
 | 子 webview 创建 `ensure_bili_webview` | [webview.rs:605](../src-tauri/src/webview.rs#L605) |
 | 命令 `open_bilibili_webview` | [webview.rs:704](../src-tauri/src/webview.rs#L704) |
 | 命令 `navigate_bilibili_webview`（**不 show**） | [webview.rs:718](../src-tauri/src/webview.rs#L718) |
@@ -210,6 +210,7 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 | `bili://video-event` | `bilibili://playback-event` | [playbackBridge.ts:33](../src/services/playbackBridge.ts#L33) |
 | `bili://capture-html` | `bilibili://parse-result` | [parseService.ts:19](../src/services/parseService.ts#L19) |
 | `bili://page-loaded` | `bilibili://page-state` | [App.tsx](../src/App.tsx)（`ready` 继续；`verification-required` 提示验证） |
+| `bili://debug` | `bilibili://debug` | [App.tsx](../src/App.tsx)（`console.warn` 到主 devtools；播放控制流程诊断，修复后可移除） |
 
 **Rust → 前端（窗口事件）**：`bilibili://window-resized`（[lib.rs:79](../src-tauri/src/lib.rs#L79)）→ [App.tsx:203](../src/App.tsx#L203) 重测 bounds。
 

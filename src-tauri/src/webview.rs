@@ -62,6 +62,8 @@ const BRIDGE_INIT: &str = r#"(function(){
     try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: event, payload: payload }); } catch(e){}
   }
   if (window.location.protocol !== 'https:' || !allowedHost(window.location.hostname)) return;
+  // 诊断：确认 BRIDGE_INIT 在视频页运行（排除 initialization_script 未注入/被早退）。
+  try { emit('bili://debug', { msg: 'BRIDGE_INIT ready=' + document.readyState + ' href=' + window.location.href }); } catch(e){}
   if (!window.__BILI_LIST_PLAYER_AUTOPLAY_GUARD__) {
     window.__BILI_LIST_PLAYER_AUTOPLAY_GUARD__ = true;
     window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = 0;
@@ -89,10 +91,12 @@ const BRIDGE_INIT: &str = r#"(function(){
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
   emit('bili://page-loaded', { url: window.location.href });
-  var SELECTORS = 'video, .bpx-player-container video, .bilibili-player video';
+  var SELECTORS = 'bwp-video, video, .bpx-player-container video, .bpx-player-video-wrap video, .bilibili-player video';
   var deadline = Date.now() + 60000;
   function hookVideo(v){
     if (v.__BILI_HOOKED__) return; v.__BILI_HOOKED__ = true;
+    // 诊断：确认 hook 到了哪个 <video>（tagName/readyState/duration），便于排查事件是否上报。
+    try { emit('bili://debug', { msg: 'hookVideo tagName=' + v.tagName + ' readyState=' + v.readyState + ' duration=' + (isFinite(v.duration)?v.duration:'NaN') }); } catch(e){}
     ['play','pause','ended','error','timeupdate'].forEach(function(t){
       v.addEventListener(t, function(){
         var payload = { type: t, itemId: window.location.pathname, positionSeconds: v.currentTime || 0 };
@@ -100,9 +104,20 @@ const BRIDGE_INIT: &str = r#"(function(){
         emit('bili://video-event', payload);
       });
     });
+    // DASH 流尾部未缓冲时原生 ended 可能不触发，用 timeupdate 兜底：接近末尾即补发 ended，
+    // 与原生 ended 去重（__BILI_ENDING__）。重新播放时复位标志。
+    v.addEventListener('timeupdate', function(){
+      if (isFinite(v.duration) && v.duration > 0 && (v.duration - (v.currentTime || 0)) < 0.5 && !v.__BILI_ENDING__) {
+        v.__BILI_ENDING__ = true;
+        emit('bili://video-event', { type: 'ended', itemId: window.location.pathname, positionSeconds: v.currentTime || 0, durationSeconds: v.duration });
+      }
+    });
+    v.addEventListener('play', function(){ v.__BILI_ENDING__ = false; });
   }
   function tryHook(){
     var nodes = document.querySelectorAll(SELECTORS);
+    // 诊断：tryHook 找到几个候选节点（document 级 querySelectorAll，不穿透 Shadow DOM）。
+    if (nodes.length) try { emit('bili://debug', { msg: 'tryHook found=' + nodes.length + ' first=' + (nodes[0] && nodes[0].tagName) }); } catch(e){}
     for (var i=0;i<nodes.length;i++) hookVideo(nodes[i]);
     if (Date.now() < deadline) setTimeout(tryHook, 500);
   }
@@ -341,10 +356,74 @@ pub(crate) fn restore_playback_settings_script() -> &'static str {
 /// play() 被 WebView2 自动播放策略（NotAllowedError）拒绝时降级为静音播放，并注册一次性
 /// 手势监听在用户首次交互时解除静音；__BILI_UNMUTE_PENDING__ 标志防多次 Play 堆叠监听。
 const PLAY_CONTROL_HELPERS: &str = r#"(function(){
-  function pick(){ return document.querySelector('.bpx-player-container video') || document.querySelector('.bilibili-player video') || document.querySelector('video'); }
+  function dbg(msg){
+    msg = String(msg);
+    try { console.log('[bili-ctrl] ' + msg); } catch(_){}
+    // 同时 emit 到主 webview（bilibili://debug），便于在应用主 devtools 排查（子 webview devtools 不易打开）。
+    try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: 'bili://debug', payload: { msg: msg } }); } catch(_){}
+  }
+  // 事件上报：与 BRIDGE_INIT 的 emit 同实现。控制脚本独立 eval，不复用 BRIDGE_INIT 作用域。
+  function emit(event, payload){
+    try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: event, payload: payload }); } catch(e){}
+  }
+  // hook 真 <video> 的事件（play/pause/ended/error/timeupdate）→ emit bili://video-event。
+  // 与 BRIDGE_INIT 的 hookVideo 同逻辑，共用 __BILI_HOOKED__ 守卫互斥。关键修复：
+  // BRIDGE_INIT 的 document 级 MutationObserver 抓不到 <bwp-video> 内（疑似 Shadow DOM）的
+  // 真 <video> → 事件永不发到 Rust → 前端拿不到 duration（进度条 disabled）且 ended 不触发切歌。
+  // 控制脚本的 pickVideo 能找到该 <video>（见 bootstrap 日志），故在此 hook，确保事件上报可靠。
+  // 只读 currentTime/duration（合规），不读媒体流地址或 cookie。
+  function ensureHooked(v){
+    if (!v || v.tagName !== 'VIDEO' || v.__BILI_HOOKED__) return;
+    v.__BILI_HOOKED__ = true;
+    dbg('ensureHooked readyState=' + v.readyState + ' duration=' + (isFinite(v.duration) ? v.duration : 'NaN'));
+    ['play','pause','ended','error','timeupdate'].forEach(function(t){
+      v.addEventListener(t, function(){
+        var p = { type: t, itemId: window.location.pathname, positionSeconds: v.currentTime || 0 };
+        if (isFinite(v.duration) && v.duration > 0) p.durationSeconds = v.duration;
+        emit('bili://video-event', p);
+      });
+    });
+    // DASH 流尾部未缓冲时原生 ended 可能不触发，用 timeupdate 兜底（与 BRIDGE_INIT 同）。
+    v.addEventListener('timeupdate', function(){
+      if (isFinite(v.duration) && v.duration > 0 && (v.duration - (v.currentTime || 0)) < 0.5 && !v.__BILI_ENDING__) {
+        v.__BILI_ENDING__ = true;
+        emit('bili://video-event', { type: 'ended', itemId: window.location.pathname, positionSeconds: v.currentTime || 0, durationSeconds: v.duration });
+      }
+    });
+    v.addEventListener('play', function(){ v.__BILI_ENDING__ = false; });
+  }
+  // B 站可能用 <bwp-video> 自定义元素包裹真实 <video>，且 SPA 切歌瞬间会有多个 <video>
+  // （旧播放器未销毁 + 新的在建）。querySelector 第一个未必是当前可见的那个 → 对它设
+  // currentTime/play 会静默失败。故遍历取「可见且有尺寸、readyState>=1」的那个。
+  function pickVideo(){
+    var all = document.querySelectorAll('bwp-video, .bpx-player-container video, .bpx-player-video-wrap video, .bilibili-player video, video');
+    var fallback = null;
+    for (var i=0;i<all.length;i++){
+      var v = all[i];
+      // 只控制真正的 <video>（HTMLVideoElement）。<bwp-video> 是 B 站自定义元素，没有
+      // HTMLMediaElement 的 play()/readyState/videoWidth/currentTime，操作它无法控制播放。
+      // 早期页面 <bwp-video> 先于内部 <video> 出现，曾作为 fallback 被返回 → v.play() 抛错
+      // 或无效 → 加载后不自动开播（用户却可手动按播放按钮开播，因为那时 <video> 已就绪）。
+      // bwp-video 留在 selector 仅供 BRIDGE_INIT hook 事件，控制时一律跳过。
+      if (!v || v.tagName !== 'VIDEO') continue;
+      if (!fallback) fallback = v;
+      // 优先可见（offsetParent 非 null 且有视频尺寸）且已就绪的元素。
+      if (v.readyState >= 1 && v.videoWidth > 0 && v.offsetParent !== null) return v;
+    }
+    return fallback;
+  }
+  // B 站播放/暂停按钮（新版 bpx 与旧版 bilibili-player 两套选择器）。
+  function pickPlayBtn(){
+    return document.querySelector('.bpx-player-ctrl-play') ||
+      document.querySelector('.bilibili-player-video-btn-start') ||
+      document.querySelector('.bpx-player-video-btn-start') ||
+      document.querySelector('[aria-label="播放"]') || document.querySelector('[aria-label="暂停"]');
+  }
   function oncePlay(v){
+    if (!v || typeof v.play !== 'function') { dbg('oncePlay: no play()'); return Promise.resolve(); }
     window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = (window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__||0)+1;
     return v.play().then(function(){}).catch(function(e){
+      dbg('oncePlay: rejected ' + (e && e.name));
       if (e && e.name === 'NotAllowedError') {
         v.muted = true;
         window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = (window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__||0)+1;
@@ -358,28 +437,80 @@ const PLAY_CONTROL_HELPERS: &str = r#"(function(){
       }
     });
   }
+  // play() 可能静默成功但视频未真正开播（B 站播放器遮罩/占位 video），故主动播放并复核重试。
+  // 关键：B 站「自动开播」被我方禁用后，页面加载完 <video> 未必有流（readyState=0、无 src）→
+  // v.play() 以非 NotAllowedError 失败、静音降级不触发 → 卡住。重试按 readyState 分诊：
+  //   readyState<1（必为暂停、无流）：点 B 站自己的播放按钮触发它 fetch playurl 并设 src
+  //     （src 设置发生在 B 站内部 play() 之前；我方守卫会拦截 B 站那次 play()，但 src 已就绪）。
+  //     仅在 readyState<1 时点按钮，避免「播放中点按钮」toggle 成暂停的竞态。
+  //   readyState>=1（已有流）：oncePlay 即可（守卫 allowance+1；浏览器拦则静音降级）。
+  // 每轮重新 pickVideo：bpx-player SPA 切歌可能换 <video> 元素，旧引用会失效。
   function playV(v){
-    // 主动播放并复核：play() 可能静默成功但视频未真正开播（B 站播放器遮罩/占位 video）。
-    // 1.5s 后若仍 paused 且 currentTime 未前进，重试若干次，确保切歌后真正开播。
-    oncePlay(v);
+    function bootstrap(cur){
+      if (!cur || typeof cur.play !== 'function') return;
+      ensureHooked(cur); // 确保找到的 <video> 已 hook 事件，Rust/前端才能收到 duration/ended。
+      dbg('bootstrap readyState=' + cur.readyState + ' paused=' + cur.paused + ' t=' + (cur.currentTime||0));
+      if (cur.readyState < 1) {
+        var btn = pickPlayBtn();
+        if (btn) { try { btn.click(); } catch(_){} }
+      }
+      oncePlay(cur);
+    }
+    bootstrap(v);
     var tries = 0;
     setTimeout(function check(){
-      if (tries++ > 8) return;
-      if (v.paused || v.currentTime <= 0) { oncePlay(v); setTimeout(check, 1500); }
-    }, 1500);
+      if (tries++ > 12) { dbg('playV: giving up after retries'); return; } // ~12×800ms≈9.6s
+      var cur = pickVideo() || v;
+      if (!cur || typeof cur.play !== 'function') { setTimeout(check, 800); return; }
+      ensureHooked(cur); // SPA 切歌可能换 <video> 元素，重 hook 新的。
+      if (cur.paused) {
+        dbg('retry#' + tries + ' paused readyState=' + cur.readyState);
+        bootstrap(cur);
+        setTimeout(check, 800);
+      } else if ((cur.currentTime || 0) <= 0 && cur.readyState < 3) {
+        // 播放中但卡在 0（缓冲中）：幂等 play，不点按钮以免 toggle 成暂停。
+        oncePlay(cur);
+        setTimeout(check, 800);
+      } else {
+        dbg('playV: playing ok t=' + (cur.currentTime||0));
+      }
+    }, 800);
   }
-  function poll(fn){ var deadline = Date.now() + 10000; (function step(){ var v = pick(); if (v) { fn(v); return; } if (Date.now() < deadline) setTimeout(step, 250); })(); }
-  window.__BILI_CTRL__ = { play: playV, poll: poll };
+  function pauseV(v){
+    try { v.pause(); } catch(_){}
+    // 直接 pause 失败时点 B 站暂停按钮兜底。
+    var btn = pickPlayBtn();
+    if (btn && !v.paused) { try { btn.click(); } catch(_){} }
+  }
+  function poll(fn){ var deadline = Date.now() + 10000; (function step(){ var v = pickVideo(); if (v) { ensureHooked(v); fn(v); return; } if (Date.now() < deadline) setTimeout(step, 250); })(); }
+  // seek：用 readyState>=2（HAVE_CURRENT_DATA）确保 duration 已就绪，否则 Math.min(max(p,0),NaN)
+  // 得 NaN 会让 currentTime=NaN 静默失败（「点了没反应」根因）。未就绪则等 loadedmetadata 再 seek，
+  // 并在 500ms 后复核：若位置未到目标则重试一次（DASH 流缓冲延迟兜底）。
+  function seekTo(v, p){
+    var doSeek = function(){
+      if (isFinite(v.duration) && v.duration > 0) p = Math.min(Math.max(p, 0), v.duration);
+      try { v.currentTime = p; } catch(_){}
+    };
+    if (v.readyState >= 2) doSeek();
+    else v.addEventListener('loadedmetadata', doSeek, { once: true });
+    setTimeout(function(){
+      if (Math.abs((v.currentTime || 0) - p) > 1.5) {
+        if (v.readyState >= 2) doSeek();
+      }
+    }, 500);
+  }
+  window.__BILI_CTRL__ = { play: playV, pause: pauseV, poll: poll, seekTo: seekTo, pickVideo: pickVideo, pickPlayBtn: pickPlayBtn };
 })();"#;
 
 fn control_script(cmd: &PlaybackCommandDto) -> String {
     match cmd {
         PlaybackCommandDto::Play => format!("{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.play(v);}});", helpers = PLAY_CONTROL_HELPERS),
         PlaybackCommandDto::Pause => format!(
-            r#"(function(){{var v=document.querySelector('.bpx-player-container video')||document.querySelector('.bilibili-player video')||document.querySelector('video');if(v){{v.pause();}}}})();"#
+            r#"{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.pause(v);}});"#,
+            helpers = PLAY_CONTROL_HELPERS
         ),
         PlaybackCommandDto::Seek { position_seconds } => format!(
-            r#"{helpers}window.__BILI_CTRL__.poll(function(v){{var seek=function(){{var p={p};if(isFinite(v.duration)&&v.duration>0)p=Math.min(Math.max(p,0),v.duration);v.currentTime=p;}};if(v.readyState>=1)seek();else v.addEventListener('loadedmetadata',seek,{{once:true}});}});"#,
+            r#"{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.seekTo(v,{p});}});"#,
             helpers = PLAY_CONTROL_HELPERS,
             p = position_seconds
         ),
@@ -398,7 +529,7 @@ fn seek_and_play_control_script(position_seconds: f64, should_play: bool) -> Str
         ""
     };
     format!(
-        r#"{helpers}window.__BILI_CTRL__.poll(function(v){{var seek=function(){{var p={p};if(isFinite(v.duration)&&v.duration>0)p=Math.min(Math.max(p,0),v.duration);v.currentTime=p;}};if(v.readyState>=1)seek();else v.addEventListener('loadedmetadata',seek,{{once:true}});{play}}});"#,
+        r#"{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.seekTo(v,{p});{play}}});"#,
         helpers = PLAY_CONTROL_HELPERS,
         p = position_seconds,
         play = play
@@ -531,6 +662,18 @@ pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send 
             Ok(v) => v,
             Err(_) => return,
         };
+        // 诊断：确认子 webview 的视频事件是否到达 Rust、duration 值、ended 是否触发。
+        // timeupdate 太密，只在 duration 变化或非 progress 事件时打印。
+        {
+            let et = value.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            if et != "timeupdate" {
+                eprintln!(
+                    "[bili-evt] {et} pos={pos} dur={dur}",
+                    pos = value.get("positionSeconds").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    dur = value.get("durationSeconds").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                );
+            }
+        }
         let Some(parsed) = validate_video_event_payload(&value) else {
             return;
         };
@@ -606,10 +749,23 @@ pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send 
         );
     });
 
+    // 诊断通道：注入脚本经 dbg() emit 的调试信息转发到主 webview（bilibili://debug），
+    // 便于在应用主 devtools 控制台查看子 webview 内的播放控制流程。
+    let app_d = app.clone();
+    app.listen("bili://debug", move |event| {
+        let value: serde_json::Value = match serde_json::from_str(event.payload()) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        // 同时打到终端，便于在 tauri dev 输出里直接查看子 webview 内播放控制流程。
+        if let Some(msg) = value.get("msg").and_then(|v| v.as_str()) {
+            eprintln!("[bili-ctrl] {msg}");
+        }
+        let _ = app_d.emit_to("main", "bilibili://debug", value);
+    });
+
     Ok(())
 }
-
-/// 获取或创建 Bilibili 子 webview（嵌入主窗口内，非弹窗）。
 /// 被 async 命令调用——源码（webview/mod.rs:290/331）明示 `add_child` 在 async
 /// 命令里不会死锁。已存在则返回现有子 webview。
 fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
@@ -650,15 +806,16 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                     *state.pending_capture.lock().unwrap() = Some((src, req));
                 }
             }
-            // 播放意图只在目标页 Finished 时消费。中间页（建子 webview 时的 BILI_HOME、
-            // about:blank、风控中转）playback_matches=false → 一律不动 pending_*，
-            // 避免首页偷走 pending_play 导致视频页加载完反而不播放。
-            let playback_matches = state
-                .pending_playback_url
-                .lock()
-                .unwrap()
+            // 诊断：确认 Finished 时播放意图是否命中目标页。终端（tauri dev）可见 [bili] 行。
+            let pending_pb_url = state.pending_playback_url.lock().unwrap().clone();
+            let playback_matches = pending_pb_url
                 .as_deref()
                 .is_some_and(|target| same_list_page(target, &url));
+            eprintln!(
+                "[bili] Finished url={url} pending_playback_url={pending_pb_url:?} matches={playback_matches} pending_seek={:?} pending_play={}",
+                state.pending_seek.lock().unwrap(),
+                *state.pending_play.lock().unwrap()
+            );
             if playback_matches {
                 *state.pending_playback_url.lock().unwrap() = None;
                 let pending_seek = state.pending_seek.lock().unwrap().take();
@@ -670,6 +827,7 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                 };
                 if let Some(pos) = pending_seek {
                     let wv = webview.clone();
+                    eprintln!("[bili] eval seek_and_play pos={pos} should_play={should_play}");
                     // Finished 后 B 站 SPA 未必已建好 <video>，故延一拍再用轮询脚本
                     // 等待 <video> 出现后再 seek + play（合并成一次 eval，避免两次独立轮询竞争）。
                     std::thread::spawn(move || {
@@ -677,6 +835,7 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                         let _ = wv.eval(&seek_and_play_control_script(pos, should_play));
                     });
                 } else if should_play {
+                    eprintln!("[bili] eval control Play (no pending_seek)");
                     let _ = webview.eval(&control_script(&PlaybackCommandDto::Play));
                 }
             }
@@ -1056,17 +1215,21 @@ mod tests {
     #[test]
     fn control_script_play() {
         let script = control_script(&PlaybackCommandDto::Play);
-        // 轮询等待 <video> 出现后再播，带 NotAllowedError 静音降级与手势解静音。
+        // 轮询等待 <video> 出现后再播，带 NotAllowedError 静音降级、手势解静音与 B 站播放按钮兜底。
         assert!(script.contains("__BILI_CTRL__.poll"));
         assert!(script.contains("v.play()"));
         assert!(script.contains("__BILI_LIST_PLAYER_PLAY_ALLOWANCE__"));
         assert!(script.contains("NotAllowedError"));
         assert!(script.contains("v.muted"));
+        assert!(script.contains("pickPlayBtn"));
     }
 
     #[test]
     fn control_script_pause() {
-        assert!(control_script(&PlaybackCommandDto::Pause).contains("v.pause()"));
+        let script = control_script(&PlaybackCommandDto::Pause);
+        // 直接 v.pause()，失败时点 B 站暂停按钮兜底。
+        assert!(script.contains("__BILI_CTRL__.pause"));
+        assert!(script.contains("v.pause()"));
     }
 
     #[test]
@@ -1074,12 +1237,15 @@ mod tests {
         let script = control_script(&PlaybackCommandDto::Seek {
             position_seconds: 1.5
         });
-        // 同样轮询等待 <video>，命中后 clamp+seek，loadedmetadata 作为兜底。
+        // 轮询等待 <video>，命中后用 seekTo（readyState>=2 + loadedmetadata 兜底 + 500ms 复核）。
         assert!(script.contains("__BILI_CTRL__.poll"));
+        assert!(script.contains("__BILI_CTRL__.seekTo(v,1.5)"));
+        assert!(script.contains("readyState >= 2"));
         assert!(script.contains("loadedmetadata"));
-        assert!(script.contains("var p=1.5"));
-        assert!(script.contains("v.currentTime=p"));
-        assert!(script.contains(".bpx-player-container video"));
+        assert!(script.contains("v.currentTime = p"));
+        // 选择器覆盖 bwp-video 自定义元素与多 video 可见过滤。
+        assert!(script.contains("bwp-video"));
+        assert!(script.contains("videoWidth > 0"));
     }
 
     #[test]
@@ -1092,17 +1258,56 @@ mod tests {
     fn seek_and_play_control_script_seeks_then_plays() {
         let script = seek_and_play_control_script(12.5, true);
         // 单次 eval 合并 seek + play，避免两次独立轮询竞争。
-        assert!(script.contains("var p=12.5"));
-        assert!(script.contains("v.currentTime=p"));
+        assert!(script.contains("__BILI_CTRL__.seekTo(v,12.5)"));
         assert!(script.contains("__BILI_CTRL__.play(v)"));
-        assert!(script.contains("loadedmetadata"));
     }
 
     #[test]
     fn seek_and_play_control_script_skip_play_when_not_requested() {
         let script = seek_and_play_control_script(0.0, false);
-        assert!(script.contains("var p=0"));
+        assert!(script.contains("__BILI_CTRL__.seekTo(v,0)"));
         assert!(!script.contains("__BILI_CTRL__.play(v)"));
+    }
+
+    #[test]
+    fn play_control_helpers_pick_video_skips_bwp_video_custom_element() {
+        // <bwp-video> 是 B 站自定义元素，非 HTMLVideoElement，没有 play()/readyState/videoWidth，
+        // 操作它无法控制播放。控制时必须跳过、只接受真正的 <video>。否则早期页面
+        // <bwp-video> 先于内部 <video> 出现时会被当作 fallback 返回 → v.play() 抛错/无效
+        // → 加载后不自动开播（而用户稍后按播放按钮时 <video> 已就绪，故手动可播）。
+        let s = control_script(&PlaybackCommandDto::Play);
+        assert!(s.contains("tagName !== 'VIDEO'"), "pickVideo must skip non-<video> nodes");
+        assert!(s.contains("bwp-video"), "bwp-video kept in selector for BRIDGE_INIT hook");
+        assert!(s.contains("videoWidth > 0"));
+    }
+
+    #[test]
+    fn play_control_helpers_bootstraps_stream_when_no_metadata() {
+        // B 站「自动开播」被我方禁用后，页面加载完 <video> 未必有流（readyState<1）→
+        // v.play() 以非 NotAllowedError 失败、静音降级不触发 → 卡住。playV 须在 readyState<1
+        // 时点 B 站播放按钮触发拉流（src 在 B 站内部 play() 之前设置，我方守卫拦截其 play()
+        // 但 src 已就绪），readyState>=1 时直接 oncePlay；且每轮重新 pickVideo（SPA 可能换元素）。
+        let s = control_script(&PlaybackCommandDto::Play);
+        assert!(s.contains("readyState < 1"), "click B站 button only when stream not loaded");
+        assert!(s.contains("bootstrap"));
+        assert!(s.contains("typeof cur.play !== 'function'"), "defensive against non-media nodes");
+        assert!(s.contains("pickVideo() || v"), "re-pick video each retry");
+    }
+
+    #[test]
+    fn play_control_helpers_hook_events_on_found_video() {
+        // 关键修复：BRIDGE_INIT 的 document 级 MutationObserver 抓不到 <bwp-video> 内（疑似
+        // Shadow DOM）的真 <video> → 事件永不发到 Rust → 前端拿不到 duration（进度条 disabled）
+        // 且 ended 不触发切歌。控制脚本找到 <video> 时须自己 hook 事件（emit bili://video-event），
+        // 共用 __BILI_HOOKED__ 守卫与 BRIDGE_INIT 互斥。只读 currentTime/duration（合规）。
+        let s = control_script(&PlaybackCommandDto::Play);
+        assert!(s.contains("ensureHooked"), "control script must hook events on found video");
+        assert!(s.contains("bili://video-event"), "must emit video events");
+        assert!(s.contains("positionSeconds"), "payload carries position");
+        assert!(!s.contains(".src"), "must not read media src");
+        assert!(!s.contains("currentSrc"), "must not read currentSrc");
+        // poll 与 retry 均须 ensureHooked，覆盖 SPA 切歌换 <video> 元素的场景。
+        assert!(s.contains("ensureHooked(v); fn(v)"), "poll hooks before invoking callback");
     }
 
     #[test]
