@@ -62,8 +62,6 @@ const BRIDGE_INIT: &str = r#"(function(){
     try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: event, payload: payload }); } catch(e){}
   }
   if (window.location.protocol !== 'https:' || !allowedHost(window.location.hostname)) return;
-  // 诊断：确认 BRIDGE_INIT 在视频页运行（排除 initialization_script 未注入/被早退）。
-  try { emit('bili://debug', { msg: 'BRIDGE_INIT ready=' + document.readyState + ' href=' + window.location.href }); } catch(e){}
   if (!window.__BILI_LIST_PLAYER_AUTOPLAY_GUARD__) {
     window.__BILI_LIST_PLAYER_AUTOPLAY_GUARD__ = true;
     window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = 0;
@@ -95,8 +93,6 @@ const BRIDGE_INIT: &str = r#"(function(){
   var deadline = Date.now() + 60000;
   function hookVideo(v){
     if (v.__BILI_HOOKED__) return; v.__BILI_HOOKED__ = true;
-    // 诊断：确认 hook 到了哪个 <video>（tagName/readyState/duration），便于排查事件是否上报。
-    try { emit('bili://debug', { msg: 'hookVideo tagName=' + v.tagName + ' readyState=' + v.readyState + ' duration=' + (isFinite(v.duration)?v.duration:'NaN') }); } catch(e){}
     ['play','pause','ended','error','timeupdate'].forEach(function(t){
       v.addEventListener(t, function(){
         var payload = { type: t, itemId: window.location.pathname, positionSeconds: v.currentTime || 0 };
@@ -116,8 +112,6 @@ const BRIDGE_INIT: &str = r#"(function(){
   }
   function tryHook(){
     var nodes = document.querySelectorAll(SELECTORS);
-    // 诊断：tryHook 找到几个候选节点（document 级 querySelectorAll，不穿透 Shadow DOM）。
-    if (nodes.length) try { emit('bili://debug', { msg: 'tryHook found=' + nodes.length + ' first=' + (nodes[0] && nodes[0].tagName) }); } catch(e){}
     for (var i=0;i<nodes.length;i++) hookVideo(nodes[i]);
     if (Date.now() < deadline) setTimeout(tryHook, 500);
   }
@@ -356,12 +350,6 @@ pub(crate) fn restore_playback_settings_script() -> &'static str {
 /// play() 被 WebView2 自动播放策略（NotAllowedError）拒绝时降级为静音播放，并注册一次性
 /// 手势监听在用户首次交互时解除静音；__BILI_UNMUTE_PENDING__ 标志防多次 Play 堆叠监听。
 const PLAY_CONTROL_HELPERS: &str = r#"(function(){
-  function dbg(msg){
-    msg = String(msg);
-    try { console.log('[bili-ctrl] ' + msg); } catch(_){}
-    // 同时 emit 到主 webview（bilibili://debug），便于在应用主 devtools 排查（子 webview devtools 不易打开）。
-    try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: 'bili://debug', payload: { msg: msg } }); } catch(_){}
-  }
   // 事件上报：与 BRIDGE_INIT 的 emit 同实现。控制脚本独立 eval，不复用 BRIDGE_INIT 作用域。
   function emit(event, payload){
     try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: event, payload: payload }); } catch(e){}
@@ -370,12 +358,11 @@ const PLAY_CONTROL_HELPERS: &str = r#"(function(){
   // 与 BRIDGE_INIT 的 hookVideo 同逻辑，共用 __BILI_HOOKED__ 守卫互斥。关键修复：
   // BRIDGE_INIT 的 document 级 MutationObserver 抓不到 <bwp-video> 内（疑似 Shadow DOM）的
   // 真 <video> → 事件永不发到 Rust → 前端拿不到 duration（进度条 disabled）且 ended 不触发切歌。
-  // 控制脚本的 pickVideo 能找到该 <video>（见 bootstrap 日志），故在此 hook，确保事件上报可靠。
+  // 控制脚本的 pickVideo 能找到该 <video>，故在此 hook，确保事件上报可靠。
   // 只读 currentTime/duration（合规），不读媒体流地址或 cookie。
   function ensureHooked(v){
     if (!v || v.tagName !== 'VIDEO' || v.__BILI_HOOKED__) return;
     v.__BILI_HOOKED__ = true;
-    dbg('ensureHooked readyState=' + v.readyState + ' duration=' + (isFinite(v.duration) ? v.duration : 'NaN'));
     ['play','pause','ended','error','timeupdate'].forEach(function(t){
       v.addEventListener(t, function(){
         var p = { type: t, itemId: window.location.pathname, positionSeconds: v.currentTime || 0 };
@@ -420,10 +407,9 @@ const PLAY_CONTROL_HELPERS: &str = r#"(function(){
       document.querySelector('[aria-label="播放"]') || document.querySelector('[aria-label="暂停"]');
   }
   function oncePlay(v){
-    if (!v || typeof v.play !== 'function') { dbg('oncePlay: no play()'); return Promise.resolve(); }
+    if (!v || typeof v.play !== 'function') return Promise.resolve();
     window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = (window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__||0)+1;
     return v.play().then(function(){}).catch(function(e){
-      dbg('oncePlay: rejected ' + (e && e.name));
       if (e && e.name === 'NotAllowedError') {
         v.muted = true;
         window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = (window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__||0)+1;
@@ -449,7 +435,6 @@ const PLAY_CONTROL_HELPERS: &str = r#"(function(){
     function bootstrap(cur){
       if (!cur || typeof cur.play !== 'function') return;
       ensureHooked(cur); // 确保找到的 <video> 已 hook 事件，Rust/前端才能收到 duration/ended。
-      dbg('bootstrap readyState=' + cur.readyState + ' paused=' + cur.paused + ' t=' + (cur.currentTime||0));
       if (cur.readyState < 1) {
         var btn = pickPlayBtn();
         if (btn) { try { btn.click(); } catch(_){} }
@@ -459,20 +444,17 @@ const PLAY_CONTROL_HELPERS: &str = r#"(function(){
     bootstrap(v);
     var tries = 0;
     setTimeout(function check(){
-      if (tries++ > 12) { dbg('playV: giving up after retries'); return; } // ~12×800ms≈9.6s
+      if (tries++ > 12) return; // ~12×800ms≈9.6s
       var cur = pickVideo() || v;
       if (!cur || typeof cur.play !== 'function') { setTimeout(check, 800); return; }
       ensureHooked(cur); // SPA 切歌可能换 <video> 元素，重 hook 新的。
       if (cur.paused) {
-        dbg('retry#' + tries + ' paused readyState=' + cur.readyState);
         bootstrap(cur);
         setTimeout(check, 800);
       } else if ((cur.currentTime || 0) <= 0 && cur.readyState < 3) {
         // 播放中但卡在 0（缓冲中）：幂等 play，不点按钮以免 toggle 成暂停。
         oncePlay(cur);
         setTimeout(check, 800);
-      } else {
-        dbg('playV: playing ok t=' + (cur.currentTime||0));
       }
     }, 800);
   }
@@ -662,18 +644,6 @@ pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send 
             Ok(v) => v,
             Err(_) => return,
         };
-        // 诊断：确认子 webview 的视频事件是否到达 Rust、duration 值、ended 是否触发。
-        // timeupdate 太密，只在 duration 变化或非 progress 事件时打印。
-        {
-            let et = value.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            if et != "timeupdate" {
-                eprintln!(
-                    "[bili-evt] {et} pos={pos} dur={dur}",
-                    pos = value.get("positionSeconds").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    dur = value.get("durationSeconds").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                );
-            }
-        }
         let Some(parsed) = validate_video_event_payload(&value) else {
             return;
         };
@@ -749,21 +719,6 @@ pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send 
         );
     });
 
-    // 诊断通道：注入脚本经 dbg() emit 的调试信息转发到主 webview（bilibili://debug），
-    // 便于在应用主 devtools 控制台查看子 webview 内的播放控制流程。
-    let app_d = app.clone();
-    app.listen("bili://debug", move |event| {
-        let value: serde_json::Value = match serde_json::from_str(event.payload()) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        // 同时打到终端，便于在 tauri dev 输出里直接查看子 webview 内播放控制流程。
-        if let Some(msg) = value.get("msg").and_then(|v| v.as_str()) {
-            eprintln!("[bili-ctrl] {msg}");
-        }
-        let _ = app_d.emit_to("main", "bilibili://debug", value);
-    });
-
     Ok(())
 }
 /// 被 async 命令调用——源码（webview/mod.rs:290/331）明示 `add_child` 在 async
@@ -806,16 +761,15 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                     *state.pending_capture.lock().unwrap() = Some((src, req));
                 }
             }
-            // 诊断：确认 Finished 时播放意图是否命中目标页。终端（tauri dev）可见 [bili] 行。
-            let pending_pb_url = state.pending_playback_url.lock().unwrap().clone();
-            let playback_matches = pending_pb_url
+            // 播放意图只在目标页 Finished 时消费。中间页（建子 webview 时的 BILI_HOME、
+            // about:blank、风控中转）playback_matches=false → 一律不动 pending_*，
+            // 避免首页偷走 pending_play 导致视频页加载完反而不播放。
+            let playback_matches = state
+                .pending_playback_url
+                .lock()
+                .unwrap()
                 .as_deref()
                 .is_some_and(|target| same_list_page(target, &url));
-            eprintln!(
-                "[bili] Finished url={url} pending_playback_url={pending_pb_url:?} matches={playback_matches} pending_seek={:?} pending_play={}",
-                state.pending_seek.lock().unwrap(),
-                *state.pending_play.lock().unwrap()
-            );
             if playback_matches {
                 *state.pending_playback_url.lock().unwrap() = None;
                 let pending_seek = state.pending_seek.lock().unwrap().take();
@@ -827,7 +781,6 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                 };
                 if let Some(pos) = pending_seek {
                     let wv = webview.clone();
-                    eprintln!("[bili] eval seek_and_play pos={pos} should_play={should_play}");
                     // Finished 后 B 站 SPA 未必已建好 <video>，故延一拍再用轮询脚本
                     // 等待 <video> 出现后再 seek + play（合并成一次 eval，避免两次独立轮询竞争）。
                     std::thread::spawn(move || {
@@ -835,7 +788,6 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                         let _ = wv.eval(&seek_and_play_control_script(pos, should_play));
                     });
                 } else if should_play {
-                    eprintln!("[bili] eval control Play (no pending_seek)");
                     let _ = webview.eval(&control_script(&PlaybackCommandDto::Play));
                 }
             }
