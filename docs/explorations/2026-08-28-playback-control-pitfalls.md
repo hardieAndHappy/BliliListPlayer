@@ -110,11 +110,13 @@ B 站"自动开播"被我方禁用后，加载完 `<video>` 未必有流（`read
 - `readyState >= 1`（已有流）：直接 `oncePlay`（守卫 `allowance+1`；浏览器拦则静音降级）。
 - 只在 `readyState<1`（必为暂停）时点按钮，避免"播放中点按钮 toggle 成暂停"的竞态。
 
-### 3.4 诊断通道（验证用，可后续移除）
+### 3.4 诊断通道（已移除）
 
-注入脚本 `dbg()` 同时 `console.log` 并 emit `bili://debug` → Rust 转发 `bilibili://debug` → `App.tsx` `console.warn` 到主 devtools；Rust 侧 `on_page_load` / `bili://video-event` 监听器 `eprintln` `[bili]` / `[bili-evt]` 到 `tauri dev` 终端。
+修复验证期间曾加诊断通道：注入脚本 `dbg()` 同时 `console.log` 并 emit `bili://debug` → Rust 转发 `bilibili://debug` → `App.tsx` `console.warn` 到主 devtools；Rust 侧 `on_page_load` / `bili://video-event` 监听器 `eprintln` `[bili]` / `[bili-evt]` 到 `tauri dev` 终端。
 
 运行时日志确认事件到达：`ensureHooked readyState=4 duration=215` → `[bili-evt] play pos=0 dur=215` → 进度条启用、ended 沿同管道触发切歌。
+
+问题修复并验证后已移除全部诊断代码（commit 0ed61ee），`ensureHooked` 等实际修复逻辑与回归测试保留。日后若再现类似问题，可在 Rust `bili://video-event` 监听器（事件管道咽喉点）临时加日志定位。
 
 ## 4. 关键教训
 
@@ -133,5 +135,5 @@ B 站"自动开播"被我方禁用后，加载完 `<video>` 未必有流（`read
 
 ## 6. 后续
 
-- 诊断通道（`dbg` emit + `[bili]`/`[bili-evt]` eprintln + App.tsx debug 监听）当前保留以便日后排查，确认稳定后可移除。
+- 诊断通道已移除（commit 0ed61ee），`ensureHooked` 等修复逻辑与回归测试保留。
 - BRIDGE_INIT 的 document 级 observer 现已退化为"能 hook 就 hook"的次要路径，主要事件上报由 `ensureHooked` 承担；如确认 observer 永远 0 命中，可后续精简 BRIDGE_INIT。
