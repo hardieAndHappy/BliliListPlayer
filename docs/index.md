@@ -66,6 +66,11 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 [Chrome Cookie 会话迁移探索](explorations/2026-08-27-chrome-cookie-handoff.md)
 已被当前产品路线否决，仅保留为历史决策记录。
 
+播放控制（双击开播 / 进度条 / 自动切歌）的踩坑与根因记录见
+[嵌入子 WebView 播放控制踩坑](explorations/2026-08-28-playback-control-pitfalls.md)：
+核心是 B 站真 `<video>` 在 `<bwp-video>` 内部，document 级 observer 穿不透，
+改由控制脚本 `ensureHooked` 自管事件 hook 打通上行管道。
+
 ## 3. 架构分层与数据流
 
 四层，单向依赖（UI → 服务 → IPC → Rust Core）。**Rust 是权威**，前端 DTO 镜像 Rust `model.rs`。
