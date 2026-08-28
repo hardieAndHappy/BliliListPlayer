@@ -522,17 +522,26 @@ const PLAY_CONTROL_HELPERS: &str = r#"(function(){
   // seek：用 readyState>=2（HAVE_CURRENT_DATA）确保 duration 已就绪，否则 Math.min(max(p,0),NaN)
   // 得 NaN 会让 currentTime=NaN 静默失败（「点了没反应」根因）。未就绪则等 loadedmetadata 再 seek，
   // 并在 500ms 后复核：若位置未到目标则重试一次（DASH 流缓冲延迟兜底）。
-  function seekTo(v, p){
+  // onDone：可选完成回调，在首次 doSeek 执行后触发一次（复核重试不重复触发）。seek_and_play
+  // 借此让 play 在 seek 到位后再跑，避免 readyState<2 时 play 先以旧位置开播、seek 随后才拉回 0。
+  function seekTo(v, p, onDone){
+    var done = false;
+    var fire = function(){ if (!done) { done = true; if (typeof onDone === 'function') onDone(); } };
     var doSeek = function(){
       if (isFinite(v.duration) && v.duration > 0) p = Math.min(Math.max(p, 0), v.duration);
       try { v.currentTime = p; } catch(_){}
+      fire();
     };
     if (v.readyState >= 2) doSeek();
     else v.addEventListener('loadedmetadata', doSeek, { once: true });
     setTimeout(function(){
+      // 500ms 复核：若位置偏差大且已就绪则重 seek 一次；无论就绪与否，若 onDone 仍未触发
+      // （loadedmetadata 迟迟不来、readyState 卡 <2）则兜底触发 onDone，避免 play 永不执行
+      // （双击切歌后不播放的回归根因）。
       if (Math.abs((v.currentTime || 0) - p) > 1.5) {
         if (v.readyState >= 2) doSeek();
       }
+      fire();
     }, 500);
   }
   window.__BILI_CTRL__ = { play: playV, pause: pauseV, poll: poll, seekTo: seekTo, pickVideo: pickVideo, pickPlayBtn: pickPlayBtn };
@@ -557,7 +566,9 @@ fn control_script(cmd: &PlaybackCommandDto) -> String {
 }
 
 /// Load 流程在目标页 Finished 后调用：轮询等到 <video> 出现后先 seek 到续播位，
-/// 再按 should_play 播放（带静音降级）。合并成一次 eval，避免 seek/play 两次独立轮询竞争。
+/// 再按 should_play 播放（带静音降级）。play 作为 seekTo 的完成回调，在 seek 到位后
+/// 才触发——避免 readyState<2 时 play 先以 B 站初始/历史位置开播、seek 随后才拉回 0
+/// （「不从 0 开始」根因）。
 fn seek_and_play_control_script(position_seconds: f64, should_play: bool) -> String {
     let play = if should_play {
         "window.__BILI_CTRL__.play(v);"
@@ -565,7 +576,7 @@ fn seek_and_play_control_script(position_seconds: f64, should_play: bool) -> Str
         ""
     };
     format!(
-        r#"{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.seekTo(v,{p});{play}}});"#,
+        r#"{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.seekTo(v,{p},function(){{{play}}});}});"#,
         helpers = PLAY_CONTROL_HELPERS,
         p = position_seconds,
         play = play
@@ -1358,15 +1369,21 @@ mod tests {
     #[test]
     fn seek_and_play_control_script_seeks_then_plays() {
         let script = seek_and_play_control_script(12.5, true);
-        // 单次 eval 合并 seek + play，避免两次独立轮询竞争。
-        assert!(script.contains("__BILI_CTRL__.seekTo(v,12.5)"));
+        // play 作为 seekTo 的完成回调（function(){...play(v)...}），确保 seek 到位后再播，
+        // 避免 readyState<2 时 play 先以旧位置开播、seek 随后才拉回目标位（「不从 0 开始」根因）。
+        assert!(script.contains("__BILI_CTRL__.seekTo(v,12.5,function"));
         assert!(script.contains("__BILI_CTRL__.play(v)"));
+        // play 必须在 seekTo 回调函数体内，而非与 seekTo 同级同步调用。
+        let call = "__BILI_CTRL__.seekTo(v,12.5,function(){";
+        let idx = script.find(call).unwrap();
+        let after = &script[idx + call.len()..];
+        assert!(after.contains("play(v)"), "play must be inside seekTo onDone callback");
     }
 
     #[test]
     fn seek_and_play_control_script_skip_play_when_not_requested() {
         let script = seek_and_play_control_script(0.0, false);
-        assert!(script.contains("__BILI_CTRL__.seekTo(v,0)"));
+        assert!(script.contains("__BILI_CTRL__.seekTo(v,0,function"));
         assert!(!script.contains("__BILI_CTRL__.play(v)"));
     }
 
