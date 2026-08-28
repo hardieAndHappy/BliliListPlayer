@@ -64,6 +64,18 @@ fn append_playback_event(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebView2 默认沿用 Chromium 的 `document-user-activation-required` 自动播放策略：
+    // 子 webview 里的 B 站页与主 webview 的 React UI 是不同 document，主窗口双击的手势
+    // 不会传递给 B 站页 → 直接 v.play() 会被 NotAllowedError 拒绝，视频不播 → 进度条拿不到
+    // duration 而常驻 disabled。放开自动播放策略后，我方显式 allowance+1 的 v.play() 可带声
+    // 直接开播；B 站自身自动播放仍由 BRIDGE_INIT 的守卫（allowance=0）拦截，互不干扰。
+    #[cfg(target_os = "windows")]
+    if std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default().is_empty() {
+        std::env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--autoplay-policy=no-user-gesture-required",
+        );
+    }
     tauri::Builder::default()
         .setup(|app| {
             // 便携版：数据存 exe 同级目录（免安装、随 exe 走）。
@@ -79,8 +91,16 @@ pub fn run() {
             let app_handle = app.handle().clone();
             if let Some(main) = app.get_window("main") {
                 main.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Resized(_) = event {
-                        let _ = app_handle.emit_to("main", "bilibili://window-resized", ());
+                    match event {
+                        tauri::WindowEvent::Resized(_) => {
+                            let _ = app_handle.emit_to("main", "bilibili://window-resized", ());
+                        }
+                        tauri::WindowEvent::CloseRequested { .. } => {
+                            if let Some(wv) = app_handle.get_webview(webview::BILI_LABEL) {
+                                let _ = wv.eval(webview::restore_playback_settings_script());
+                            }
+                        }
+                        _ => {}
                     }
                 });
             }

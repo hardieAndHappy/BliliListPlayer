@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import type { PlaybackMode } from '../types/playlist';
 
 interface Props {
@@ -9,7 +10,8 @@ interface Props {
   onPrevious: () => void;
   onNext: () => void;
   onMode: (mode: PlaybackMode) => void;
-  onSeek: (positionSeconds: number) => void;
+  onSeekRequest: (positionSeconds: number) => void;
+  onSeekCommit: (positionSeconds: number) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -27,10 +29,19 @@ const MODE_LABELS: Record<PlaybackMode, string> = {
 };
 
 /** 底部播放控制：图标按钮（上一首/播放·暂停/下一首/循环模式）+ 进度条。
+ *  进度条拖拽采用 commit-on-release：拖动中只乐观更新 UI（不发 seek IPC），释放/失焦时
+ *  才补一次 seek，避免每像素一次 IPC 洪流且不被 progress 回写拽回。
  *  音量延后给 B 站页内播放器，本步不加音量条。 */
-export function PlaybackControls({ playing, mode, positionSeconds, durationSeconds, onPrevious, onNext, onToggle, onMode, onSeek }: Props) {
+export function PlaybackControls({ playing, mode, positionSeconds, durationSeconds, onPrevious, onNext, onToggle, onMode, onSeekRequest, onSeekCommit }: Props) {
   const max = durationSeconds > 0 ? durationSeconds : 0;
   const value = Math.min(positionSeconds, max);
+  const pendingSeekRef = useRef<number | null>(null);
+  const commit = () => {
+    const pos = pendingSeekRef.current;
+    if (pos === null) return;
+    pendingSeekRef.current = null;
+    onSeekCommit(pos);
+  };
   return (
     <footer className="controls">
       <button className="ctrl-icon" onClick={onPrevious} title="上一首" aria-label="上一首">
@@ -44,7 +55,19 @@ export function PlaybackControls({ playing, mode, positionSeconds, durationSecon
       <button className="ctrl-icon" onClick={onNext} title="下一首" aria-label="下一首">
         <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg>
       </button>
-      <input type="range" className="progress" min={0} max={max} step={1} value={value} disabled={durationSeconds <= 0} onChange={(event) => onSeek(Number(event.target.value))} />
+      <input
+        type="range"
+        className="progress"
+        min={0}
+        max={max}
+        step={1}
+        value={value}
+        disabled={durationSeconds <= 0}
+        onChange={(event) => { pendingSeekRef.current = Number(event.target.value); onSeekRequest(Number(event.target.value)); }}
+        onPointerUp={commit}
+        onKeyUp={commit}
+        onBlur={commit}
+      />
       <span className="time-display">{formatTime(positionSeconds)} / {formatTime(durationSeconds)}</span>
       <button className="ctrl-icon mode-btn" onClick={() => {
         const order: PlaybackMode[] = ['ordered', 'list-loop', 'single-loop', 'random'];

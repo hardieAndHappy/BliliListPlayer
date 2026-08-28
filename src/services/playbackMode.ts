@@ -1,4 +1,32 @@
-import type { PlaybackMode, PlaylistItem } from '../types/playlist';
+import type { LocalPlaylist, PlaybackMode, PlaylistItem } from '../types/playlist';
+
+export interface PlaybackNavigationContext {
+  playlistId: string;
+  items: PlaylistItem[];
+  currentItemId: string | null;
+  mode: PlaybackMode;
+}
+
+export function resolvePlaybackNavigationContext(
+  playlists: LocalPlaylist[],
+  activePlaylistId: string | null,
+  playingPlaylistId: string | null,
+  activeCurrentItemId: string | null,
+  activeMode: PlaybackMode,
+  playingItemId: string | null = null,
+  playingMode: PlaybackMode | null = null,
+): PlaybackNavigationContext | null {
+  const isPlayingContext = playingPlaylistId !== null;
+  const sourceId = playingPlaylistId ?? activePlaylistId;
+  const source = playlists.find((playlist) => playlist.id === sourceId);
+  if (!source) return null;
+  return {
+    playlistId: source.id,
+    items: source.items,
+    currentItemId: isPlayingContext ? (playingItemId ?? source.playback.currentItemId) : activeCurrentItemId,
+    mode: isPlayingContext ? (playingMode ?? source.playback.mode) : activeMode,
+  };
+}
 
 export function nextItem(items: PlaylistItem[], currentId: string | null, mode: PlaybackMode, round: string[] = [], randomSeed = 1) {
   const playable = items.filter((item) => item.status !== 'invalid' && item.status !== 'deleted');

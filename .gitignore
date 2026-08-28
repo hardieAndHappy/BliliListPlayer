@@ -10,6 +10,7 @@ src-tauri/gen/schemas/
 
 # 测试文件（不入库）
 *.test.ts
+!src/services/bilibiliPageState.test.ts
 *.test.tsx
 *.test.mjs
 tests/

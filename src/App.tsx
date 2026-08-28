@@ -3,9 +3,11 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { PlaybackControls } from './components/PlaybackControls';
 import { PlaylistQueue } from './components/PlaylistQueue';
 import { validateListUrl } from './services/bilibiliParser';
+import { getPageAccessErrorMessage } from './services/bilibiliPageState';
 import { appendEditEvent, appendPlaybackEvent } from './services/historyStore';
-import { nextItem, previousItem } from './services/playbackMode';
+import { nextItem, previousItem, resolvePlaybackNavigationContext } from './services/playbackMode';
 import { createTauriPlaybackBridge, type PlaybackCommand, type PlaybackEvent } from './services/playbackBridge';
+import { getPlaybackStartPosition, updatePlaylistItemPosition } from './services/playbackProgress';
 import { reducePlayback, type PlaybackUiState } from './services/playbackReducer';
 import { captureAndParse } from './services/parseService';
 import { createTauriStore } from './services/playlistStore';
@@ -50,7 +52,19 @@ export default function App() {
   // 当前正在播放的视频所属列表 id（与选中列表 activePlaylistId 区分）。
   // 侧边栏据此给"正在播放"的列表加播放标记；切列表浏览时若正在播放则不隐藏 webview。
   const [playingPlaylistId, setPlayingPlaylistId] = useState<string | null>(null);
-  // 队列区宽度（px），由分割栏拖拽控制；播放区占剩余宽度。持久到 localStorage 跨会话保留。
+  const playingPlaylistIdRef = useRef<string | null>(null);
+  const playingItemIdRef = useRef<string | null>(null);
+  const playingModeRef = useRef<PlaylistDocument['playlists'][number]['playback']['mode'] | null>(null);
+  const latestPositionsRef = useRef(new Map<string, number>());
+  // 拖拽进度条期间置 true，handleEvent 据此忽略 progress 回写，避免条被视频当前位置拽回。
+  const seekingRef = useRef(false);
+  // 本曲已自动切下一曲的标志：ended 事件与「接近结尾」兜底任一触发后置位，防重复切歌。
+  const autoAdvancedRef = useRef(false);
+  // 列表区和队列区宽度由分割栏拖拽控制，持久到 localStorage 跨会话保留。
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('sidebarWidth'));
+    return saved > 0 ? saved : 200;
+  });
   const [queueWidth, setQueueWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem('queueWidth'));
     return saved > 0 ? saved : 560;
@@ -58,6 +72,7 @@ export default function App() {
   const storageReady = useRef(false);
   const bridgeRef = useRef(createTauriPlaybackBridge());
   const playerRef = useRef<HTMLElement>(null);
+  const playlistScrollRef = useRef<HTMLDivElement>(null);
   // 子 webview 只在「播放/登录」时显示；导入/预览/编辑列表时隐藏，避免原生层 z-order 挡住 HTML UI。
   const webviewVisibleRef = useRef(false);
 
@@ -88,6 +103,14 @@ export default function App() {
   const current = useMemo(() => items.find((item) => item.id === currentItemId), [items, currentItemId]);
 
   useEffect(() => {
+    if (!/^已追加 \d+ 项到当前列表$/.test(notice)) return;
+    const timer = window.setTimeout(() => {
+      setNotice((value) => value === notice ? '' : value);
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
     createTauriStore().load().then((document) => {
       if (document) { setPlaylists(document.playlists); setActivePlaylistId(document.activePlaylistId); }
@@ -104,22 +127,61 @@ export default function App() {
   const sendCommand = (command: PlaybackCommand) =>
     bridgeRef.current.send(command).catch((error) => setNotice(`播放控制失败：${String(error)}`));
 
+  const loadAndPlay = async (url: string, positionSeconds: number) => {
+    try {
+      await bridgeRef.current.send({ type: 'load', url, positionSeconds });
+      await bridgeRef.current.send({ type: 'play' });
+    } catch (error) {
+      setNotice(`播放控制失败：${String(error)}`);
+    }
+  };
+
   const goNext = (fromId: string | null = currentItemId) => {
-    const result = nextItem(items, fromId, mode);
+    flushCurrentPosition();
+    const context = resolvePlaybackNavigationContext(
+      playlists,
+      activePlaylistId,
+      playingPlaylistIdRef.current,
+      currentItemId,
+      mode,
+      playingItemIdRef.current ?? fromId,
+      playingModeRef.current,
+    );
+    if (!context) return;
+    const result = nextItem(context.items, context.currentItemId, context.mode);
     if (!result.itemId) return;
-    const next = items.find((item) => item.id === result.itemId);
+    const next = context.items.find((item) => item.id === result.itemId);
     if (!next) return;
-    setCurrentItemId(result.itemId);
-    sendCommand({ type: 'load', url: next.url, positionSeconds: next.lastPositionSeconds });
+    const positionSeconds = getPlaybackStartPosition();
+    if (context.playlistId === activePlaylistId) setCurrentItemId(result.itemId);
+    setPlayingPlaylistId(context.playlistId);
+    playingPlaylistIdRef.current = context.playlistId;
+    playingItemIdRef.current = next.id;
+    void loadAndPlay(next.url, positionSeconds);
   };
 
   const goPrevious = () => {
-    const result = previousItem(items, currentItemId, mode);
+    flushCurrentPosition();
+    const context = resolvePlaybackNavigationContext(
+      playlists,
+      activePlaylistId,
+      playingPlaylistIdRef.current,
+      currentItemId,
+      mode,
+      playingItemIdRef.current,
+      playingModeRef.current,
+    );
+    if (!context) return;
+    const result = previousItem(context.items, context.currentItemId, context.mode);
     if (!result.itemId) return;
-    const prev = items.find((item) => item.id === result.itemId);
+    const prev = context.items.find((item) => item.id === result.itemId);
     if (!prev) return;
-    setCurrentItemId(result.itemId);
-    sendCommand({ type: 'load', url: prev.url, positionSeconds: prev.lastPositionSeconds });
+    const positionSeconds = getPlaybackStartPosition();
+    if (context.playlistId === activePlaylistId) setCurrentItemId(result.itemId);
+    setPlayingPlaylistId(context.playlistId);
+    playingPlaylistIdRef.current = context.playlistId;
+    playingItemIdRef.current = prev.id;
+    void loadAndPlay(prev.url, positionSeconds);
   };
 
   const recordPlayback = (event: PlaybackEvent) => {
@@ -134,35 +196,59 @@ export default function App() {
     }).catch((error) => setNotice(`记录播放历史失败：${String(error)}`));
   };
 
-  const savePosition = (itemId: string, positionSeconds: number) => {
-    setPlaylists((value) => value.map((playlist) =>
-      playlist.id === activePlaylistId
-        ? { ...playlist, items: playlist.items.map((item) => item.id === itemId ? { ...item, lastPositionSeconds: positionSeconds } : item), updatedAt: new Date().toISOString() }
-        : playlist
-    ));
+  const savePosition = (itemId: string, positionSeconds: number, playlistId = playingPlaylistIdRef.current) => {
+    latestPositionsRef.current.set(itemId, positionSeconds);
+    setPlaylists((value) => updatePlaylistItemPosition(value, playlistId, itemId, positionSeconds));
+  };
+
+  const flushCurrentPosition = () => {
+    const itemId = playingItemIdRef.current;
+    if (!itemId) return;
+    const positionSeconds = latestPositionsRef.current.get(itemId);
+    if (positionSeconds === undefined) return;
+    savePosition(itemId, positionSeconds);
   };
 
   // 桥接事件 → 纯状态机 + 副作用（§5.3）。playing 由 started 驱动单一真相，不在此同步置位。
   const handleEvent = (event: PlaybackEvent) => {
+    // 拖拽进度条期间忽略视频 progress 回写，避免条被视频旧位置拽回；释放后即恢复。
+    if (event.type === 'progress' && seekingRef.current) return;
     setPlayback((state) => reducePlayback(state, event));
     switch (event.type) {
       case 'started':
         recordPlayback(event);
+        // 新视频开始播放，重置自动切歌标志，允许本曲播完后再切。
+        autoAdvancedRef.current = false;
         break;
       case 'paused':
         recordPlayback(event);
-        savePosition(event.itemId, event.positionSeconds);
+        if (event.itemId === playingItemIdRef.current) {
+          savePosition(event.itemId, event.positionSeconds);
+        }
         break;
       case 'ended':
         recordPlayback(event);
         savePosition(event.itemId, 0);
-        goNext(event.itemId);
+        if (!autoAdvancedRef.current) {
+          autoAdvancedRef.current = true;
+          goNext(event.itemId);
+        }
         break;
       case 'error':
         recordPlayback(event);
         setNotice(`播放失败：${event.message}`);
         break;
       case 'progress':
+        if (event.itemId === playingItemIdRef.current) {
+          latestPositionsRef.current.set(event.itemId, event.positionSeconds);
+          // B 站 SPA 未必可靠触发原生 ended；播放位置接近末尾（剩 ≤2s 或 ≥99%）时兜底自动切下一曲。
+          if (!autoAdvancedRef.current && event.durationSeconds > 0 &&
+              event.positionSeconds >= event.durationSeconds - 2 &&
+              event.positionSeconds >= event.durationSeconds * 0.99) {
+            autoAdvancedRef.current = true;
+            goNext(event.itemId);
+          }
+        }
         break;
     }
   };
@@ -189,7 +275,8 @@ export default function App() {
     if (!('__TAURI_INTERNALS__' in window)) return;
     let unsubscribe: UnlistenFn | undefined;
     listen<{ url: string; loginState: string }>('bilibili://page-state', (event) => {
-      if (event.payload.loginState === 'guest') setNotice('检测到未登录或被风控，请在播放区登录 B 站后再导入');
+      const message = getPageAccessErrorMessage(event.payload.loginState);
+      if (message) setNotice(message);
     }).then((un) => { unsubscribe = un; });
     return () => { unsubscribe?.(); };
   }, []);
@@ -257,6 +344,56 @@ export default function App() {
     const input = window.prompt(`粘贴 Bilibili 列表或视频地址（${BILIBILI_LIST_HINT}）`);
     if (!input?.trim()) return;
     void importList(input.trim());
+  };
+
+  const handleAddUrlToCurrentPlaylist = async () => {
+    if (!active) {
+      setNotice('请先选择一个列表');
+      return;
+    }
+    await hideBilibiliWebview();
+    const input = window.prompt('粘贴要追加到当前列表的 Bilibili 视频地址');
+    if (!input?.trim()) return;
+    let url: URL;
+    try {
+      url = validateListUrl(input.trim());
+      if (!url.pathname.startsWith('/video/')) throw new Error('请输入有效的 Bilibili 视频地址');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '地址无效');
+      return;
+    }
+    const normalized = url.toString();
+    setBusy(true);
+    setNotice('正在解析视频地址…');
+    try {
+      await navigateBilibili(normalized);
+      const { items: parsedItems } = await captureAndParse(normalized);
+      const existingIds = new Set(active.items.map((item) => item.id.toLowerCase()));
+      const newItems = parsedItems
+        .filter((item) => !existingIds.has(item.id.toLowerCase()))
+        .map((item, index) => toPlaylistItem(item, active.items.length + index));
+      if (!newItems.length) {
+        setNotice('该视频已在当前列表中');
+        return;
+      }
+      setPlaylists((value) => value.map((playlist) =>
+        playlist.id === active.id
+          ? { ...playlist, items: [...playlist.items, ...newItems], updatedAt: new Date().toISOString() }
+          : playlist
+      ));
+      appendEditEvent({
+        timestamp: new Date().toISOString(),
+        eventType: 'import',
+        itemIds: newItems.map((item) => item.id),
+        playlistId: active.id,
+        sourcePlaylistUrl: normalized,
+      }).catch((error) => setNotice(`记录编辑历史失败：${String(error)}`));
+      setNotice(`已追加 ${newItems.length} 项到当前列表`);
+    } catch (error) {
+      setNotice(`导入失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const applyImport = (parsedItems: ParsedItem[], sourceUrl: string, existing: LocalPlaylist | null, listTitle: string | null): number => {
@@ -362,13 +499,33 @@ export default function App() {
     }).catch((error) => setNotice(`记录编辑历史失败：${String(error)}`));
   };
 
-  /** 分割栏拖拽：按鼠标移动增减 queueWidth，钳制到 [240, 窗口宽-568]（留 sidebar 200 + splitter 8 + 播放区最小 360），并实时重测 webview bounds。
+  /** 列表区/队列区分割栏拖拽：调整 sidebarWidth，并实时重测 WebView bounds。 */
+  const onSidebarSplitterMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+    let latest = startWidth;
+    const onMove = (ev: MouseEvent) => {
+      latest = Math.min(Math.max(startWidth + (ev.clientX - startX), 160), 360);
+      setSidebarWidth(latest);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      localStorage.setItem('sidebarWidth', String(latest));
+      void measureAndReportBounds();
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  /** 队列区/播放区分割栏拖拽：按鼠标移动增减 queueWidth，钳制到 [240, 窗口宽-568]（留列表区、分割线和播放区最小 360），并实时重测 WebView bounds。
    *  mousemove/mouseup 挂 window 以便鼠标移出分割栏仍能跟踪。 */
   const onSplitterMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = queueWidth;
-    const max = window.innerWidth - 200 - 8 - 360;
+    const max = Math.max(240, window.innerWidth - sidebarWidth - 16 - 360);
     let latest = startWidth;
     const onMove = (ev: MouseEvent) => {
       latest = Math.min(Math.max(startWidth + (ev.clientX - startX), 240), max);
@@ -385,26 +542,50 @@ export default function App() {
   };
 
   const handlePlay = (item: PlaylistItem) => {
+    flushCurrentPosition();
+    autoAdvancedRef.current = false;
+    const positionSeconds = getPlaybackStartPosition();
     setCurrentItemId(item.id);
     setPlayingPlaylistId(activePlaylistId);
+    playingPlaylistIdRef.current = activePlaylistId;
+    playingItemIdRef.current = item.id;
+    playingModeRef.current = mode;
     webviewVisibleRef.current = true;
     void measureAndReportBounds();
-    sendCommand({ type: 'load', url: item.url, positionSeconds: item.lastPositionSeconds });
+    void loadAndPlay(item.url, positionSeconds);
+  };
+
+  const scrollToCurrentItem = () => {
+    playlistScrollRef.current
+      ?.querySelector<HTMLElement>('[data-current="true"]')
+      ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   };
 
   const onToggle = () => sendCommand(playback.playing ? { type: 'pause' } : { type: 'play' });
-  const onSeek = (positionSeconds: number) => sendCommand({ type: 'seek', positionSeconds });
+  // 拖拽中：仅乐观更新 UI、置 seeking，不发 IPC（避免每像素一次 seek 洪流）。
+  const onSeekRequest = (positionSeconds: number) => {
+    seekingRef.current = true;
+    setPlayback((state) => ({ ...state, positionSeconds }));
+  };
+  // 释放/失焦：结束 seeking，落定位置并补一次 seek IPC。随后 progress 事件恢复回写。
+  const onSeekCommit = (positionSeconds: number) => {
+    seekingRef.current = false;
+    setPlayback((state) => ({ ...state, positionSeconds }));
+    const itemId = playingItemIdRef.current;
+    if (itemId) latestPositionsRef.current.set(itemId, positionSeconds);
+    sendCommand({ type: 'seek', positionSeconds });
+  };
 
   // 打开登录页 / 显示嵌入区前先上报矩形，确保子 webview 创建即落在播放区。
   const handleOpenLogin = async () => { webviewVisibleRef.current = true; await measureAndReportBounds(); openBilibiliLogin(); };
   const handleShowWebview = async () => { webviewVisibleRef.current = true; await measureAndReportBounds(); focusBilibiliWebview(); };
 
   return (
-    <div className="app-shell" style={{ '--queue-w': `${queueWidth}px` } as React.CSSProperties}>
+    <div
+      className="app-shell"
+      style={{ '--sidebar-w': `${sidebarWidth}px`, '--queue-w': `${queueWidth}px` } as React.CSSProperties}
+    >
       <aside className="sidebar">
-        <div className="sidebar-head">
-          <strong>已保存列表</strong>
-        </div>
         <div className="sidebar-scroll">
           <button className="add-row" onClick={handleAddList} disabled={busy} title="新增列表">＋ 新增列表</button>
           {playlists.map((playlist) => {
@@ -429,19 +610,39 @@ export default function App() {
           <button>编辑历史</button>
         </div>
       </aside>
+      <div className="sidebar-splitter" onMouseDown={onSidebarSplitterMouseDown} title="拖拽调整列表区宽度" />
       <section className="queue">
-        <h1>{active?.name || '我的播放列表'}</h1>
-        {active && <small className="source-url">来源：{active.sourceUrl}</small>}
-        {notice && <div className="notice">{notice}</div>}
-        <PlaylistQueue items={items} currentItemId={currentItemId} onPlay={handlePlay} onDelete={handleDelete} />
+        <header className="queue-header">
+          <div className="queue-title-row">
+            <h1>{active?.name || '我的播放列表'}</h1>
+            <button
+              className="queue-add"
+              onClick={() => void handleAddUrlToCurrentPlaylist()}
+              disabled={busy || !active}
+              aria-label="导入单独 URL 到当前列表"
+              title="导入单独 URL 到当前列表"
+            >+</button>
+          </div>
+          {notice && <div className="notice">{notice}</div>}
+        </header>
+        <div className="playlist-scroll" ref={playlistScrollRef}>
+          <PlaylistQueue items={items} currentItemId={currentItemId} onPlay={handlePlay} onDelete={handleDelete} />
+        </div>
+        <button
+          className="queue-jump-current"
+          onClick={scrollToCurrentItem}
+          disabled={!currentItemId}
+          aria-label="移动到当前播放位置"
+          title="移动到当前播放位置"
+        >↑</button>
       </section>
-      <div className="splitter" onMouseDown={onSplitterMouseDown} title="拖拽调整宽度" />
+      <div className="splitter" onMouseDown={onSplitterMouseDown} title="拖拽调整队列区宽度" />
       <section className="player" ref={playerRef}>
         <div className="webview-placeholder">
           <strong>{current?.title || 'Bilibili WebView 播放区'}</strong>
-          <span>正常网页登录与在线播放，不下载媒体。</span>
+          <span>公开内容无需登录，需要账号或验证时再登录。</span>
           <div className="player-actions">
-            <button onClick={handleOpenLogin}>打开登录页</button>
+            <button onClick={handleOpenLogin}>应用内登录</button>
             <button onClick={handleShowWebview}>显示 WebView</button>
           </div>
         </div>
@@ -454,8 +655,14 @@ export default function App() {
         onToggle={onToggle}
         onPrevious={goPrevious}
         onNext={() => goNext()}
-        onMode={setMode}
-        onSeek={onSeek}
+        onMode={(nextMode) => {
+          setMode(nextMode);
+          if (activePlaylistId === playingPlaylistIdRef.current) {
+            playingModeRef.current = nextMode;
+          }
+        }}
+        onSeekRequest={onSeekRequest}
+        onSeekCommit={onSeekCommit}
       />
       {ctxMenu && (
         <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>

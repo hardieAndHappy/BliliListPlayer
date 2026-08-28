@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { ParsedItem } from '../types/playlist';
+import { getPageAccessErrorMessage } from './bilibiliPageState';
 
 /**
  * 调用 Rust 解析适配器（§7），把列表页 HTML 解析为结构化项目 DTO。
@@ -15,19 +16,18 @@ export async function captureAndParse(sourceUrl: string): Promise<{ items: Parse
   let un: UnlistenFn | undefined;
   let unState: UnlistenFn | undefined;
   return new Promise((resolve, reject) => {
-    const timer: ReturnType<typeof setTimeout> = setTimeout(() => { un?.(); unState?.(); reject(new Error('解析超时，请确认 WebView 已登录且列表页已加载')); }, 20000);
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => { un?.(); unState?.(); reject(new Error('解析超时，请确认网络正常且列表页可访问')); }, 20000);
     listen<{ requestId: string; items: ParsedItem[]; error?: string; listTitle?: string }>('bilibili://parse-result', (e) => {
       if (e.payload.requestId !== requestId) return;
       clearTimeout(timer); un?.(); unState?.();
       e.payload.error ? reject(new Error(e.payload.error)) : resolve({ items: e.payload.items, listTitle: e.payload.listTitle ?? null });
     }).then((u) => (un = u));
-    // 风控/登录拦截：B 站把未登录访问 302 到 passport.bilibili.com 验证页，
-    // capture 脚本永远等不到列表 DOM。监听 page-state 的 guest 信号立即失败，不傻等 20s。
+    // 只有 B 站实际跳转到 Passport 登录/验证页时才早退；公开页面和旧版 guest 状态继续抓取。
     listen<{ loginState: string; url: string }>('bilibili://page-state', (e) => {
-      if (e.payload.loginState === 'guest') {
-        clearTimeout(timer); un?.(); unState?.();
-        reject(new Error('被 B 站风控拦截（未登录）。请先点「打开登录页」在播放区登录 B 站，再重新导入'));
-      }
+      const message = getPageAccessErrorMessage(e.payload.loginState);
+      if (!message) return;
+      clearTimeout(timer); un?.(); unState?.();
+      reject(new Error(message));
     }).then((u) => (unState = u));
     invoke('capture_list_html', { sourceUrl, requestId }).catch((err) => { clearTimeout(timer); un?.(); unState?.(); reject(err); });
   });

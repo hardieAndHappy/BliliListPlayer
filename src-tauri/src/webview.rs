@@ -26,12 +26,32 @@ fn is_allowed_bili_host(host: &str) -> bool {
     )
 }
 
-/// 比较两个 URL 是否指向同一列表页（host+path），忽略 query/fragment。
-/// B 站常规范化 query（如去掉 oid/bvid），精确 `src == url` 会导致 capture 永不触发（20s 超时）。
+fn page_access_state(url: &str) -> &'static str {
+    match Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        Some(host) if host == "passport.bilibili.com" => "verification-required",
+        _ => "ready",
+    }
+}
+
+/// 比较两个 URL 是否指向同一列表页（host+path），忽略 query/fragment 与末尾斜杠。
+/// B 站常规范化 query（如去掉 oid/bvid），且会把视频页 `/video/BV1` 规范化为 `/video/BV1/`，
+/// 精确比较会让 capture 与播放意图永不触发（pending_seek/pending_play 一直匹配不上）。
 fn same_list_page(a: &str, b: &str) -> bool {
     match (Url::parse(a).ok(), Url::parse(b).ok()) {
-        (Some(x), Some(y)) => x.host_str() == y.host_str() && x.path() == y.path(),
+        (Some(x), Some(y)) => x.host_str() == y.host_str() && normalize_path(x.path()) == normalize_path(y.path()),
         _ => a == b,
+    }
+}
+
+/// 去掉路径末尾 `/`（保留根 `/`），使 `/video/BV1` 与 `/video/BV1/` 视作同一页。
+fn normalize_path(path: &str) -> &str {
+    if path.len() > 1 && path.ends_with('/') {
+        &path[..path.len() - 1]
+    } else {
+        path
     }
 }
 
@@ -42,6 +62,32 @@ const BRIDGE_INIT: &str = r#"(function(){
     try { window.__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: event, payload: payload }); } catch(e){}
   }
   if (window.location.protocol !== 'https:' || !allowedHost(window.location.hostname)) return;
+  if (!window.__BILI_LIST_PLAYER_AUTOPLAY_GUARD__) {
+    window.__BILI_LIST_PLAYER_AUTOPLAY_GUARD__ = true;
+    window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = 0;
+    var nativePlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function(){
+      if (window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ > 0) {
+        window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__--;
+        return nativePlay.apply(this, arguments);
+      }
+      try { this.pause(); } catch(e) {}
+      return Promise.reject(new DOMException('Autoplay disabled by BiliListPlayer', 'NotAllowedError'));
+    };
+    function disableAutoplay(node) {
+      if (node && node instanceof HTMLMediaElement) node.autoplay = false;
+    }
+    document.querySelectorAll('video,audio').forEach(disableAutoplay);
+    new MutationObserver(function(records){
+      records.forEach(function(record){
+        for (var i=0;i<record.addedNodes.length;i++) {
+          var node = record.addedNodes[i];
+          disableAutoplay(node);
+          if (node && node.querySelectorAll) node.querySelectorAll('video,audio').forEach(disableAutoplay);
+        }
+      });
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  }
   emit('bili://page-loaded', { url: window.location.href });
   var SELECTORS = 'video, .bpx-player-container video, .bilibili-player video';
   var deadline = Date.now() + 60000;
@@ -58,8 +104,20 @@ const BRIDGE_INIT: &str = r#"(function(){
   function tryHook(){
     var nodes = document.querySelectorAll(SELECTORS);
     for (var i=0;i<nodes.length;i++) hookVideo(nodes[i]);
-    if (nodes.length === 0 && Date.now() < deadline) setTimeout(tryHook, 500);
+    if (Date.now() < deadline) setTimeout(tryHook, 500);
   }
+  new MutationObserver(function(records){
+    records.forEach(function(record){
+      for (var i=0;i<record.addedNodes.length;i++) {
+        var node = record.addedNodes[i];
+        if (node && node.matches && node.matches(SELECTORS)) hookVideo(node);
+        if (node && node.querySelectorAll) {
+          var videos = node.querySelectorAll(SELECTORS);
+          for (var j=0;j<videos.length;j++) hookVideo(videos[j]);
+        }
+      }
+    });
+  }).observe(document.documentElement, { childList: true, subtree: true });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryHook);
   else tryHook();
 })();"#;
@@ -197,26 +255,154 @@ fn capture_script(source_url: &str, request_id: &str) -> String {
     .replace("__BILI_MEDIALIST_API__", BILI_MEDIALIST_API)
 }
 
+fn playback_settings_script() -> &'static str {
+    r#"(function(){
+  var KEY = '__BILI_LIST_PLAYER_PLAYBACK_SETTINGS__';
+  var labels = {
+    autoNext: ['自动切集'],
+    autoPlay: ['自动开播', '自动播放']
+  };
+  function textOf(node){
+    var parent = node && node.parentElement;
+    return ((node && (node.innerText || node.textContent || '')) + ' ' +
+      (node && (node.getAttribute('aria-label') || node.getAttribute('title') || '')) + ' ' +
+      (parent && (parent.innerText || parent.textContent || ''))).replace(/\s+/g, '');
+  }
+  function findControl(names){
+    var nodes = document.querySelectorAll('input[type="checkbox"],[role="switch"],[role="checkbox"],button,[class*="setting"]');
+    for (var i=0;i<nodes.length;i++) {
+      var text = textOf(nodes[i]);
+      for (var j=0;j<names.length;j++) if (text.indexOf(names[j]) >= 0) return nodes[i];
+    }
+    return null;
+  }
+  function isOn(node){
+    if (!node) return null;
+    if (typeof node.checked === 'boolean') return node.checked;
+    var aria = node.getAttribute('aria-checked');
+    if (aria === 'true' || aria === 'false') return aria === 'true';
+    var cls = (' ' + (node.className || '') + ' ' + (node.parentElement && node.parentElement.className || '') + ' ').toLowerCase();
+    if (/\b(active|on|checked|enabled|open)\b/.test(cls)) return true;
+    if (/\b(off|unchecked|disabled|close|closed)\b/.test(cls)) return false;
+    return null;
+  }
+  function clickIfNeeded(node, desired){
+    var current = isOn(node);
+    if (current !== null && current !== desired) node.click();
+  }
+  function readState(){
+    try { return JSON.parse(sessionStorage.getItem(KEY) || 'null'); } catch(e) { return null; }
+  }
+  function writeState(state){
+    try { sessionStorage.setItem(KEY, JSON.stringify(state)); } catch(e) {}
+  }
+  function disable(){
+    var state = readState() || { captured: {}, original: {} };
+    ['autoNext','autoPlay'].forEach(function(name){
+      var node = findControl(labels[name]);
+      if (!node) return;
+      var current = isOn(node);
+      if (!state.captured[name] && current !== null) {
+        state.captured[name] = true;
+        state.original[name] = current;
+      }
+      clickIfNeeded(node, false);
+    });
+    if (Object.keys(state.captured).length) writeState(state);
+  }
+  function restore(){
+    var state = readState();
+    if (!state) return;
+    ['autoNext','autoPlay'].forEach(function(name){
+      if (!state.captured[name]) return;
+      var node = findControl(labels[name]);
+      if (node) clickIfNeeded(node, state.original[name]);
+    });
+  }
+  window.__BILI_LIST_PLAYER_RESTORE_SETTINGS__ = restore;
+  if (!window.__BILI_LIST_PLAYER_SETTINGS_HOOKED__) {
+    window.__BILI_LIST_PLAYER_SETTINGS_HOOKED__ = true;
+    window.addEventListener('beforeunload', restore);
+  }
+  var deadline = Date.now() + 10000;
+  (function poll(){
+    disable();
+    if (Date.now() < deadline) setTimeout(poll, 250);
+  })();
+})();"#
+}
+
+pub(crate) fn restore_playback_settings_script() -> &'static str {
+    "window.__BILI_LIST_PLAYER_RESTORE_SETTINGS__ && window.__BILI_LIST_PLAYER_RESTORE_SETTINGS__();"
+}
+
+/// 播放控制脚本共用的 JS 辅助：轮询等待 B 站 SPA 异步创建的 <video>、带静音降级的播放。
+/// Finished 后 800ms B 站播放器未必建好 <video>，故先轮询（每 250ms、上限 10s）再操作。
+/// play() 被 WebView2 自动播放策略（NotAllowedError）拒绝时降级为静音播放，并注册一次性
+/// 手势监听在用户首次交互时解除静音；__BILI_UNMUTE_PENDING__ 标志防多次 Play 堆叠监听。
+const PLAY_CONTROL_HELPERS: &str = r#"(function(){
+  function pick(){ return document.querySelector('.bpx-player-container video') || document.querySelector('.bilibili-player video') || document.querySelector('video'); }
+  function oncePlay(v){
+    window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = (window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__||0)+1;
+    return v.play().then(function(){}).catch(function(e){
+      if (e && e.name === 'NotAllowedError') {
+        v.muted = true;
+        window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__ = (window.__BILI_LIST_PLAYER_PLAY_ALLOWANCE__||0)+1;
+        v.play().catch(function(){});
+        if (!window.__BILI_UNMUTE_PENDING__) {
+          window.__BILI_UNMUTE_PENDING__ = true;
+          function unmute(){ try { v.muted = false; } catch(_){} window.__BILI_UNMUTE_PENDING__ = false; window.removeEventListener('pointerdown', unmute, true); window.removeEventListener('keydown', unmute, true); }
+          window.addEventListener('pointerdown', unmute, true);
+          window.addEventListener('keydown', unmute, true);
+        }
+      }
+    });
+  }
+  function playV(v){
+    // 主动播放并复核：play() 可能静默成功但视频未真正开播（B 站播放器遮罩/占位 video）。
+    // 1.5s 后若仍 paused 且 currentTime 未前进，重试若干次，确保切歌后真正开播。
+    oncePlay(v);
+    var tries = 0;
+    setTimeout(function check(){
+      if (tries++ > 8) return;
+      if (v.paused || v.currentTime <= 0) { oncePlay(v); setTimeout(check, 1500); }
+    }, 1500);
+  }
+  function poll(fn){ var deadline = Date.now() + 10000; (function step(){ var v = pick(); if (v) { fn(v); return; } if (Date.now() < deadline) setTimeout(step, 250); })(); }
+  window.__BILI_CTRL__ = { play: playV, poll: poll };
+})();"#;
+
 fn control_script(cmd: &PlaybackCommandDto) -> String {
-    let selectors = "video, .bpx-player-container video, .bilibili-player video";
     match cmd {
-        PlaybackCommandDto::Play => format!(
-            r#"(function(){{var v=document.querySelector('{s}');if(v){{v.play().catch(function(){{}});}}}})();"#,
-            s = selectors
-        ),
+        PlaybackCommandDto::Play => format!("{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.play(v);}});", helpers = PLAY_CONTROL_HELPERS),
         PlaybackCommandDto::Pause => format!(
-            r#"(function(){{var v=document.querySelector('{s}');if(v){{v.pause();}}}})();"#,
-            s = selectors
+            r#"(function(){{var v=document.querySelector('.bpx-player-container video')||document.querySelector('.bilibili-player video')||document.querySelector('video');if(v){{v.pause();}}}})();"#
         ),
         PlaybackCommandDto::Seek { position_seconds } => format!(
-            r#"(function(){{var v=document.querySelector('{s}');if(v){{v.currentTime={p};}}}})();"#,
-            s = selectors,
+            r#"{helpers}window.__BILI_CTRL__.poll(function(v){{var seek=function(){{var p={p};if(isFinite(v.duration)&&v.duration>0)p=Math.min(Math.max(p,0),v.duration);v.currentTime=p;}};if(v.readyState>=1)seek();else v.addEventListener('loadedmetadata',seek,{{once:true}});}});"#,
+            helpers = PLAY_CONTROL_HELPERS,
             p = position_seconds
         ),
         PlaybackCommandDto::Next | PlaybackCommandDto::Previous | PlaybackCommandDto::Load { .. } => {
             String::new()
         }
     }
+}
+
+/// Load 流程在目标页 Finished 后调用：轮询等到 <video> 出现后先 seek 到续播位，
+/// 再按 should_play 播放（带静音降级）。合并成一次 eval，避免 seek/play 两次独立轮询竞争。
+fn seek_and_play_control_script(position_seconds: f64, should_play: bool) -> String {
+    let play = if should_play {
+        "window.__BILI_CTRL__.play(v);"
+    } else {
+        ""
+    };
+    format!(
+        r#"{helpers}window.__BILI_CTRL__.poll(function(v){{var seek=function(){{var p={p};if(isFinite(v.duration)&&v.duration>0)p=Math.min(Math.max(p,0),v.duration);v.currentTime=p;}};if(v.readyState>=1)seek();else v.addEventListener('loadedmetadata',seek,{{once:true}});{play}}});"#,
+        helpers = PLAY_CONTROL_HELPERS,
+        p = position_seconds,
+        play = play
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,6 +437,8 @@ pub struct CaptureState {
     pub current_url: Mutex<Option<String>>,
     pub pending_capture: Mutex<Option<(String, String)>>, // (source_url, request_id)
     pub pending_seek: Mutex<Option<f64>>,
+    pub pending_play: Mutex<bool>,
+    pub pending_playback_url: Mutex<Option<String>>,
     /// 前端最近上报的播放区矩形（逻辑像素 x,y,w,h）。子 webview 尚未创建时缓存，
     /// `ensure_bili_webview` 创建后立即套用，避免 (0,0) 全窗闪现。
     pub last_bounds: Mutex<Option<(f64, f64, f64, f64)>>,
@@ -332,7 +520,7 @@ struct ParseResultPayload {
 #[serde(rename_all = "camelCase")]
 struct PageStatePayload {
     url: String,
-    login_state: String, // "guest" | "unknown"
+    login_state: String, // "ready" | "verification-required"
 }
 
 pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -408,19 +596,12 @@ pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send 
         let Some(url) = value.get("url").and_then(|v| v.as_str()) else {
             return;
         };
-        let login_state = match Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-        {
-            Some(h) if h == "passport.bilibili.com" => "guest".to_string(),
-            _ => "unknown".to_string(),
-        };
         let _ = app_p.emit_to(
             "main",
             "bilibili://page-state",
             PageStatePayload {
                 url: url.to_string(),
-                login_state,
+                login_state: page_access_state(url).to_string(),
             },
         );
     });
@@ -469,16 +650,37 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                     *state.pending_capture.lock().unwrap() = Some((src, req));
                 }
             }
-            let pending_seek = state.pending_seek.lock().unwrap().take();
-            if let Some(pos) = pending_seek {
-                let wv = webview.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(800));
-                    let _ = wv.eval(&control_script(&PlaybackCommandDto::Seek {
-                        position_seconds: pos,
-                    }));
-                });
+            // 播放意图只在目标页 Finished 时消费。中间页（建子 webview 时的 BILI_HOME、
+            // about:blank、风控中转）playback_matches=false → 一律不动 pending_*，
+            // 避免首页偷走 pending_play 导致视频页加载完反而不播放。
+            let playback_matches = state
+                .pending_playback_url
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|target| same_list_page(target, &url));
+            if playback_matches {
+                *state.pending_playback_url.lock().unwrap() = None;
+                let pending_seek = state.pending_seek.lock().unwrap().take();
+                let should_play = {
+                    let mut pending_play = state.pending_play.lock().unwrap();
+                    let value = *pending_play;
+                    *pending_play = false;
+                    value
+                };
+                if let Some(pos) = pending_seek {
+                    let wv = webview.clone();
+                    // Finished 后 B 站 SPA 未必已建好 <video>，故延一拍再用轮询脚本
+                    // 等待 <video> 出现后再 seek + play（合并成一次 eval，避免两次独立轮询竞争）。
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                        let _ = wv.eval(&seek_and_play_control_script(pos, should_play));
+                    });
+                } else if should_play {
+                    let _ = webview.eval(&control_script(&PlaybackCommandDto::Play));
+                }
             }
+            let _ = webview.eval(playback_settings_script());
         });
     // add_child 在 async 命令（工作线程）里调用，不死锁（webview/mod.rs:290/331）。
     // 初次以 (0,0)+主窗口尺寸创建，随后由前端 set_bili_webview_bounds 校准到播放区。
@@ -592,8 +794,13 @@ pub async fn send_playback_command(
                 return Err("仅允许 Bilibili 站内导航".into());
             }
             *state.pending_seek.lock().unwrap() = Some(*position_seconds);
+            // Load 默认就要播放（loadAndPlay 总是 load+play）。pending_play 初值置 true，
+            // 即使前端 Play 命令因竞态晚于目标页 Finished 到达，Finished 时也能 should_play=true 自动开播。
+            *state.pending_play.lock().unwrap() = true;
+            *state.pending_playback_url.lock().unwrap() = Some(url.clone());
             match app.get_webview(BILI_LABEL) {
                 Some(wv) => {
+                    let _ = wv.eval(&control_script(&PlaybackCommandDto::Pause));
                     wv.navigate(parsed).map_err(|e| e.to_string())?;
                 }
                 None => {
@@ -602,7 +809,33 @@ pub async fn send_playback_command(
                 }
             }
         }
-        PlaybackCommandDto::Play | PlaybackCommandDto::Pause | PlaybackCommandDto::Seek { .. } => {
+        PlaybackCommandDto::Play => {
+            if state.pending_seek.lock().unwrap().is_some() {
+                *state.pending_play.lock().unwrap() = true;
+                return Ok(());
+            }
+            let wv = app
+                .get_webview(BILI_LABEL)
+                .ok_or("Bilibili WebView 未打开".to_string())?;
+            wv.eval(&control_script(&command))
+                .map_err(|e| e.to_string())?;
+        }
+        PlaybackCommandDto::Pause => {
+            // 防御：若上次 Load 的目标页 Finished 一直没匹配（导航失败/被风控跳转），
+            // pending_seek 会残留，导致后续 Play 按钮被上面的 early-return 永久卡住。
+            // 用户显式暂停即放弃那次未完成的加载意图，清掉以免卡死。
+            if state.pending_playback_url.lock().unwrap().is_some() {
+                *state.pending_seek.lock().unwrap() = None;
+                *state.pending_play.lock().unwrap() = false;
+                *state.pending_playback_url.lock().unwrap() = None;
+            }
+            let wv = app
+                .get_webview(BILI_LABEL)
+                .ok_or("Bilibili WebView 未打开".to_string())?;
+            wv.eval(&control_script(&command))
+                .map_err(|e| e.to_string())?;
+        }
+        PlaybackCommandDto::Seek { .. } => {
             let wv = app
                 .get_webview(BILI_LABEL)
                 .ok_or("Bilibili WebView 未打开".to_string())?;
@@ -666,6 +899,22 @@ mod tests {
     }
 
     #[test]
+    fn page_access_state_marks_public_bilibili_page_ready() {
+        assert_eq!(
+            page_access_state("https://www.bilibili.com/list/1"),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn page_access_state_marks_passport_page_verification_required() {
+        assert_eq!(
+            page_access_state("https://passport.bilibili.com/login"),
+            "verification-required"
+        );
+    }
+
+    #[test]
     fn blocks_non_bili() {
         assert!(!is_allowed_bili_host("example.com"));
         assert!(!is_allowed_bili_host("evil.bilibili.com.evil.com"));
@@ -697,6 +946,30 @@ mod tests {
         assert!(!same_list_page(
             "https://www.bilibili.com/list/1",
             "https://m.bilibili.com/list/1"
+        ));
+    }
+
+    #[test]
+    fn same_list_page_ignores_trailing_slash() {
+        // B 站把视频页规范化为带尾斜杠，而解析器生成的项目 URL 无尾斜杠；
+        // 忽略尾斜杠后播放意图才能在视频页 Finished 时匹配上。
+        assert!(same_list_page(
+            "https://www.bilibili.com/video/BV1",
+            "https://www.bilibili.com/video/BV1/"
+        ));
+        assert!(same_list_page(
+            "https://www.bilibili.com/video/BV1/",
+            "https://www.bilibili.com/video/BV1"
+        ));
+        // 根路径的尾斜杠保留，仍匹配。
+        assert!(same_list_page(
+            "https://www.bilibili.com",
+            "https://www.bilibili.com/"
+        ));
+        // 列表页同样忽略尾斜杠。
+        assert!(same_list_page(
+            "https://www.bilibili.com/list/12853451",
+            "https://www.bilibili.com/list/12853451/"
         ));
     }
 
@@ -782,7 +1055,13 @@ mod tests {
 
     #[test]
     fn control_script_play() {
-        assert!(control_script(&PlaybackCommandDto::Play).contains("v.play()"));
+        let script = control_script(&PlaybackCommandDto::Play);
+        // 轮询等待 <video> 出现后再播，带 NotAllowedError 静音降级与手势解静音。
+        assert!(script.contains("__BILI_CTRL__.poll"));
+        assert!(script.contains("v.play()"));
+        assert!(script.contains("__BILI_LIST_PLAYER_PLAY_ALLOWANCE__"));
+        assert!(script.contains("NotAllowedError"));
+        assert!(script.contains("v.muted"));
     }
 
     #[test]
@@ -792,16 +1071,72 @@ mod tests {
 
     #[test]
     fn control_script_seek() {
-        assert!(control_script(&PlaybackCommandDto::Seek {
+        let script = control_script(&PlaybackCommandDto::Seek {
             position_seconds: 1.5
-        })
-        .contains("v.currentTime=1.5"));
+        });
+        // 同样轮询等待 <video>，命中后 clamp+seek，loadedmetadata 作为兜底。
+        assert!(script.contains("__BILI_CTRL__.poll"));
+        assert!(script.contains("loadedmetadata"));
+        assert!(script.contains("var p=1.5"));
+        assert!(script.contains("v.currentTime=p"));
+        assert!(script.contains(".bpx-player-container video"));
     }
 
     #[test]
     fn control_script_next_previous_empty() {
         assert!(control_script(&PlaybackCommandDto::Next).is_empty());
         assert!(control_script(&PlaybackCommandDto::Previous).is_empty());
+    }
+
+    #[test]
+    fn seek_and_play_control_script_seeks_then_plays() {
+        let script = seek_and_play_control_script(12.5, true);
+        // 单次 eval 合并 seek + play，避免两次独立轮询竞争。
+        assert!(script.contains("var p=12.5"));
+        assert!(script.contains("v.currentTime=p"));
+        assert!(script.contains("__BILI_CTRL__.play(v)"));
+        assert!(script.contains("loadedmetadata"));
+    }
+
+    #[test]
+    fn seek_and_play_control_script_skip_play_when_not_requested() {
+        let script = seek_and_play_control_script(0.0, false);
+        assert!(script.contains("var p=0"));
+        assert!(!script.contains("__BILI_CTRL__.play(v)"));
+    }
+
+    #[test]
+    fn playback_settings_script_captures_and_disables_requested_settings() {
+        let script = playback_settings_script();
+        assert!(script.contains("自动切集"));
+        assert!(script.contains("自动开播"));
+        assert!(script.contains("sessionStorage"));
+        assert!(script.contains("captured"));
+        assert!(script.contains(".click()"));
+    }
+
+    #[test]
+    fn bridge_init_blocks_page_autoplay() {
+        assert!(BRIDGE_INIT.contains("__BILI_LIST_PLAYER_PLAY_ALLOWANCE__"));
+        assert!(BRIDGE_INIT.contains("HTMLMediaElement.prototype.play"));
+        assert!(BRIDGE_INIT.contains("autoplay = false"));
+        assert!(BRIDGE_INIT.contains("MutationObserver"));
+        assert!(BRIDGE_INIT.contains("hookVideo(node)"));
+    }
+
+    #[test]
+    fn playback_load_waits_for_target_page_before_consuming_pending_commands() {
+        assert!(same_list_page(
+            "https://www.bilibili.com/video/BV1?from=player",
+            "https://www.bilibili.com/video/BV1"
+        ));
+    }
+
+    #[test]
+    fn restore_playback_settings_script_restores_original_values() {
+        let script = restore_playback_settings_script();
+        assert!(script.contains("__BILI_LIST_PLAYER_RESTORE_SETTINGS__"));
+        assert!(script.contains("()"));
     }
 
     #[test]
