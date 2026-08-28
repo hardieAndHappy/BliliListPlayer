@@ -96,22 +96,22 @@ export default function App() {
   const items = active?.items ?? [];
   const current = useMemo(() => items.find((item) => item.id === currentItemId), [items, currentItemId]);
 
-  // 构造落盘文档：同时更新「活动列表」(activePlaylistId，侧边栏选中) 与「正在播放列表」
-  // (playingPlaylistIdRef) 的 playback.currentItemId/mode。退出时无论最后浏览哪个列表，
-  // 正在播放列表的「播到哪首 + 模式」都会落盘，重启后才能恢复上次播放。
-  // 两者同一列表时以正在播放项为准（playingItemIdRef 即真实播放项）。
+  // 构造落盘文档：播放模式是全局设置（顶层 playbackMode，跨列表共享，不随列表切换恢复默认），
+  // 列表级 playback 只存「播到哪首」(currentItemId)，不再存 mode。退出时正在播放列表的
+  // currentItemId 落盘，重启后才能恢复上次播放。
   const buildDocument = useCallback((
     playlists: LocalPlaylist[], activePlaylistId: string | null, currentItemId: string | null, mode: PlaylistDocument['playlists'][number]['playback']['mode']
   ): PlaylistDocument => ({
     version: 1,
     updatedAt: new Date().toISOString(),
     activePlaylistId,
+    playbackMode: mode,
     playlists: playlists.map((playlist) => {
       const isPlaying = playlist.id === playingPlaylistIdRef.current;
       const isActive = playlist.id === activePlaylistId;
       if (!isPlaying && !isActive) return playlist;
       const itemId = isPlaying ? playingItemIdRef.current : currentItemId;
-      return { ...playlist, playback: { ...playlist.playback, currentItemId: itemId ?? null, mode } };
+      return { ...playlist, playback: { ...playlist.playback, currentItemId: itemId ?? null } };
     }),
   }), []);
 
@@ -169,7 +169,7 @@ export default function App() {
       (recorded ? target.items.find((i) => i.id === recorded && i.status === 'playable') : undefined) ??
       target.items.find((i) => i.status === 'playable');
     if (!item) return;
-    const restoredMode = target.playback.mode;
+    const restoredMode = document.playbackMode;
     setMode(restoredMode);
     setCurrentItemId(item.id);
     setPlayingPlaylistId(target.id);
@@ -663,8 +663,8 @@ export default function App() {
                 key={playlist.id}
                 className={isActive ? 'active' : ''}
                 onClick={() => {
-                  setActivePlaylistId(playlist.id); setCurrentItemId(playlist.playback.currentItemId); setMode(playlist.playback.mode); setPlayback(initialPlaybackState);
-                  // 列表区切换只改变本地队列选择，不导航、不刷新、不隐藏当前 WebView。
+                  setActivePlaylistId(playlist.id); setCurrentItemId(playlist.playback.currentItemId); setPlayback(initialPlaybackState);
+                  // 播放模式是全局设置，切换列表不改变 mode（不恢复默认）。
                 }}
                 onContextMenu={(e) => { e.preventDefault(); setCtxMenu({ x: e.clientX, y: e.clientY, playlistId: playlist.id }); }}
               >

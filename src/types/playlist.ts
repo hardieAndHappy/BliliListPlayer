@@ -26,6 +26,8 @@ export interface PlaylistDocument {
   version: 1;
   updatedAt: string;
   activePlaylistId: string | null;
+  /** 全局播放模式（跨列表共享，不随列表切换恢复默认）。旧文件无此字段时取 'list-loop'。 */
+  playbackMode: PlaybackMode;
   playlists: LocalPlaylist[];
 }
 

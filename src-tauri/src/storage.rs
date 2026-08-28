@@ -131,6 +131,7 @@ mod tests {
             version: 1,
             updated_at: "now".into(),
             active_playlist_id: Some("local-1".into()),
+            playback_mode: PlaybackMode::Ordered,
             playlists: vec![LocalPlaylist {
                 id: "local-1".into(),
                 name: "Temporary import".into(),

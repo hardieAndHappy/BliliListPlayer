@@ -69,7 +69,14 @@ pub struct PlaylistDocument {
     pub version: u32,
     pub updated_at: String,
     pub active_playlist_id: Option<String>,
+    /// 全局播放模式（跨列表共享）。旧文件无此字段时 serde default 取 ListLoop。
+    #[serde(default = "default_playback_mode")]
+    pub playback_mode: PlaybackMode,
     pub playlists: Vec<LocalPlaylist>,
+}
+
+fn default_playback_mode() -> PlaybackMode {
+    PlaybackMode::ListLoop
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
