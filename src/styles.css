@@ -16,7 +16,7 @@
 .modal-foot .import-count{flex:1;color:#9499a0}
 .modal-foot button{border:1px solid #ddd;background:#fff;padding:8px 16px;border-radius:8px}
 .modal-foot .primary{border:0}
-.controls .progress{flex:0 1 240px;accent-color:#fb7299;max-width:240px;touch-action:none}.controls .time-display{font-variant-numeric:tabular-nums;color:#9499a0;font-size:12px;white-space:nowrap;flex:0 0 auto}
+.controls .progress{flex:0 1 240px;accent-color:#fb7299;max-width:240px;touch-action:none}.controls .time-display{font-variant-numeric:tabular-nums;color:#9499a0;font-size:12px;white-space:nowrap;flex:0 0 auto}.controls .volume-group{display:flex;align-items:center;gap:4px;flex:0 0 auto}.controls .volume{width:84px;accent-color:#fb7299;touch-action:none}
 .ctx-menu{position:fixed;z-index:60;background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 6px 20px #0002;padding:4px;min-width:140px}.ctx-menu button{display:block;width:100%;border:0;background:transparent;text-align:left;padding:8px 10px;border-radius:6px;cursor:pointer}.ctx-menu button:hover{background:#fff0f4;color:#fb7299}.ctx-menu button.danger:hover{background:#fdeaea;color:#d65}
 .queue{position:relative}
 .queue-title-row{justify-content:space-between}

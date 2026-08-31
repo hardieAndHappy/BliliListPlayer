@@ -559,6 +559,11 @@ fn control_script(cmd: &PlaybackCommandDto) -> String {
             helpers = PLAY_CONTROL_HELPERS,
             p = position_seconds
         ),
+        PlaybackCommandDto::SetVolume { volume } => format!(
+            r#"{helpers}window.__BILI_CTRL__.poll(function(v){{try{{v.volume={vol};v.muted=({vol}<=0);}}catch(_){{}}}});"#,
+            helpers = PLAY_CONTROL_HELPERS,
+            vol = volume.clamp(0.0, 1.0)
+        ),
         PlaybackCommandDto::Next | PlaybackCommandDto::Previous | PlaybackCommandDto::Load { .. } => {
             String::new()
         }
@@ -568,17 +573,23 @@ fn control_script(cmd: &PlaybackCommandDto) -> String {
 /// Load 流程在目标页 Finished 后调用：轮询等到 <video> 出现后先 seek 到续播位，
 /// 再按 should_play 播放（带静音降级）。play 作为 seekTo 的完成回调，在 seek 到位后
 /// 才触发——避免 readyState<2 时 play 先以 B 站初始/历史位置开播、seek 随后才拉回 0
-/// （「不从 0 开始」根因）。
-fn seek_and_play_control_script(position_seconds: f64, should_play: bool) -> String {
+/// （「不从 0 开始」根因）。volume=Some 时在 seekTo 之前先套用音量，与 play 同 tick
+/// 执行，避免新歌先以默认满音量开播再被拽回（跨切歌音量跳变根因）。
+fn seek_and_play_control_script(position_seconds: f64, should_play: bool, volume: Option<f64>) -> String {
+    let vol_set = match volume {
+        Some(v) => format!("try{{v.volume={vol};v.muted=({vol}<=0);}}catch(_){{}}", vol = v.clamp(0.0, 1.0)),
+        None => String::new(),
+    };
     let play = if should_play {
         "window.__BILI_CTRL__.play(v);"
     } else {
         ""
     };
     format!(
-        r#"{helpers}window.__BILI_CTRL__.poll(function(v){{window.__BILI_CTRL__.seekTo(v,{p},function(){{{play}}});}});"#,
+        r#"{helpers}window.__BILI_CTRL__.poll(function(v){{{vol_set}window.__BILI_CTRL__.seekTo(v,{p},function(){{{play}}});}});"#,
         helpers = PLAY_CONTROL_HELPERS,
         p = position_seconds,
+        vol_set = vol_set,
         play = play
     )
 }
@@ -617,6 +628,9 @@ pub struct CaptureState {
     pub pending_seek: Mutex<Option<f64>>,
     pub pending_play: Mutex<bool>,
     pub pending_playback_url: Mutex<Option<String>>,
+    /// 用户期望音量（0.0–1.0）。持久意图（读不取走）：SetVolume 设一次后，每次目标页
+    /// Finished 都重新套用到新 `<video>`，确保切歌不回满音量。None=未设过，沿用 B 站默认。
+    pub pending_volume: Mutex<Option<f64>>,
     /// 刷新单视频标题的待执行意图 (bvid, request_id)。子 webview 不在 bilibili 域时，
     /// refresh_video_title 先导航首页，Finished 后由此消费再 eval video_meta_script。
     pub pending_meta: Mutex<Option<(String, String)>>,
@@ -870,12 +884,14 @@ fn ensure_bili_webview(app: &AppHandle) -> Result<Webview, String> {
                     value
                 };
                 if let Some(pos) = pending_seek {
+                    let vol = state.pending_volume.lock().unwrap().clone();
                     let wv = webview.clone();
                     // Finished 后 B 站 SPA 未必已建好 <video>，故延一拍再用轮询脚本
                     // 等待 <video> 出现后再 seek + play（合并成一次 eval，避免两次独立轮询竞争）。
+                    // volume 一并在 poll 回调内套用（seekTo 之前），保证新歌开播即用户音量。
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(800));
-                        let _ = wv.eval(&seek_and_play_control_script(pos, should_play));
+                        let _ = wv.eval(&seek_and_play_control_script(pos, should_play, vol));
                     });
                 } else if should_play {
                     let _ = webview.eval(&control_script(&PlaybackCommandDto::Play));
@@ -1083,6 +1099,17 @@ pub async fn send_playback_command(
                 .ok_or("Bilibili WebView 未打开".to_string())?;
             wv.eval(&control_script(&command))
                 .map_err(|e| e.to_string())?;
+        }
+        PlaybackCommandDto::SetVolume { volume } => {
+            // 存为持久意图：切歌导航后目标页 Finished 时 seek_and_play_control_script 会
+            // 重新套用到新 <video>（pending_volume 读不取走）。当前页若有 webview 则即时套用，
+            // 无 webview（首次启动推音量）则只存意图，等首首歌 Finished 应用。
+            let v = volume.clamp(0.0, 1.0);
+            *state.pending_volume.lock().unwrap() = Some(v);
+            if let Some(wv) = app.get_webview(BILI_LABEL) {
+                wv.eval(&control_script(&command))
+                    .map_err(|e| e.to_string())?;
+            }
         }
         PlaybackCommandDto::Next | PlaybackCommandDto::Previous => { /* no-op：前端推进队列后发 load */ }
     }
@@ -1361,6 +1388,26 @@ mod tests {
     }
 
     #[test]
+    fn control_script_set_volume() {
+        let script = control_script(&PlaybackCommandDto::SetVolume { volume: 0.3 });
+        // 轮询等待 <video>，命中后设 v.volume 并按音量推导 muted（>0 解除静音、=0 静音）。
+        assert!(script.contains("__BILI_CTRL__.poll"));
+        assert!(script.contains("v.volume=0.3"));
+        assert!(script.contains("v.muted=(0.3<=0)"));
+        // 合规：只写 volume，不触碰媒体流地址（.src/currentSrc 才是禁字面量；cookie 仅在
+        // PLAY_CONTROL_HELPERS 注释里出现「不读…cookie」，故不对此字符串断言）。
+        assert!(!script.contains(".src"), "must not read media src");
+        assert!(!script.contains("currentSrc"));
+    }
+
+    #[test]
+    fn control_script_set_volume_clamps_out_of_range() {
+        // 越界值钳到 [0,1]，避免注入非法 JS 字面量或异常音量。
+        assert!(control_script(&PlaybackCommandDto::SetVolume { volume: 1.5 }).contains("v.volume=1"));
+        assert!(control_script(&PlaybackCommandDto::SetVolume { volume: -0.2 }).contains("v.volume=0"));
+    }
+
+    #[test]
     fn control_script_next_previous_empty() {
         assert!(control_script(&PlaybackCommandDto::Next).is_empty());
         assert!(control_script(&PlaybackCommandDto::Previous).is_empty());
@@ -1368,7 +1415,7 @@ mod tests {
 
     #[test]
     fn seek_and_play_control_script_seeks_then_plays() {
-        let script = seek_and_play_control_script(12.5, true);
+        let script = seek_and_play_control_script(12.5, true, None);
         // play 作为 seekTo 的完成回调（function(){...play(v)...}），确保 seek 到位后再播，
         // 避免 readyState<2 时 play 先以旧位置开播、seek 随后才拉回目标位（「不从 0 开始」根因）。
         assert!(script.contains("__BILI_CTRL__.seekTo(v,12.5,function"));
@@ -1382,9 +1429,31 @@ mod tests {
 
     #[test]
     fn seek_and_play_control_script_skip_play_when_not_requested() {
-        let script = seek_and_play_control_script(0.0, false);
+        let script = seek_and_play_control_script(0.0, false, None);
         assert!(script.contains("__BILI_CTRL__.seekTo(v,0,function"));
         assert!(!script.contains("__BILI_CTRL__.play(v)"));
+    }
+
+    #[test]
+    fn seek_and_play_control_script_applies_volume_before_seek() {
+        // volume=Some 时在 poll 回调内、seekTo 之前套用音量（同 tick），避免新歌先以默认满
+        // 音量开播再被拽回（跨切歌音量跳变根因）。
+        let script = seek_and_play_control_script(12.5, true, Some(0.5));
+        assert!(script.contains("v.volume=0.5"), "volume applied on found video");
+        assert!(script.contains("v.muted=(0.5<=0)"), "muted derived from volume");
+        let vol_idx = script.find("v.volume=0.5").unwrap();
+        let seek_idx = script.find("__BILI_CTRL__.seekTo").unwrap();
+        assert!(vol_idx < seek_idx, "volume must be set before seekTo");
+        assert!(script.contains("__BILI_CTRL__.play(v)"));
+        assert!(!script.contains(".src"), "must not read media src");
+        assert!(!script.contains("currentSrc"));
+    }
+
+    #[test]
+    fn seek_and_play_control_script_skips_volume_when_none() {
+        let script = seek_and_play_control_script(12.5, true, None);
+        assert!(!script.contains("v.volume"), "no volume set when None");
+        assert!(script.contains("__BILI_CTRL__.seekTo(v,12.5"));
     }
 
     #[test]
@@ -1518,6 +1587,16 @@ mod tests {
                 position_seconds: 4.25
             }
         );
+    }
+
+    #[test]
+    fn playback_commands_accept_set_volume() {
+        let cmd: PlaybackCommandDto = serde_json::from_value(json!({
+            "type": "setVolume",
+            "volume": 0.5
+        }))
+        .unwrap();
+        assert_eq!(cmd, PlaybackCommandDto::SetVolume { volume: 0.5 });
     }
 
     #[test]

@@ -61,6 +61,13 @@ export default function App() {
     const saved = Number(localStorage.getItem('queueWidth'));
     return saved > 0 ? saved : 560;
   });
+  // 全局音量（0–1），持久到 localStorage 跨会话保留；默认满音量。
+  const [volume, setVolume] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('volume'));
+    return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 1;
+  });
+  const volumeRef = useRef(volume);
+  useEffect(() => { volumeRef.current = volume; }, [volume]);
   const storageReady = useRef(false);
   // 启动恢复守卫：确保「自动恢复上次播放」只执行一次（防 React 18 严格模式 effect 双调）。
   const restoreAttemptedRef = useRef(false);
@@ -316,6 +323,14 @@ export default function App() {
     if (!('__TAURI_INTERNALS__' in window)) return;
     const unsubscribe = bridgeRef.current.subscribe((event) => handleEventRef.current(event));
     return unsubscribe;
+  }, []);
+
+  // 启动把保存的音量推给后端 pending_volume，使首首歌 Finished 即套用（webview 此刻
+  // 可能尚未创建，SetVolume 只存意图、跳过 eval；待目标页 Finished 由 seek_and_play 套用）。
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    void bridgeRef.current.send({ type: 'setVolume', volume: volumeRef.current })
+      .catch((error) => setNotice(`音量同步失败：${String(error)}`));
   }, []);
 
   useEffect(() => {
@@ -629,6 +644,13 @@ export default function App() {
   };
 
   const onToggle = () => sendCommand(playback.playing ? { type: 'pause' } : { type: 'play' });
+  // 音量即时下发（setVolume 是廉价 eval），并持久化；跨切歌保留由后端 pending_volume 负责。
+  const onVolumeChange = (v: number) => {
+    const clamped = Math.min(Math.max(v, 0), 1);
+    setVolume(clamped);
+    localStorage.setItem('volume', String(clamped));
+    sendCommand({ type: 'setVolume', volume: clamped });
+  };
   // 拖拽中：仅乐观更新 UI、置 seeking，不发 IPC（避免每像素一次 seek 洪流）。
   const onSeekRequest = (positionSeconds: number) => {
     seekingRef.current = true;
@@ -719,6 +741,7 @@ export default function App() {
         mode={mode}
         positionSeconds={playback.positionSeconds}
         durationSeconds={playback.durationSeconds}
+        volume={volume}
         onToggle={onToggle}
         onPrevious={goPrevious}
         onNext={() => goNext()}
@@ -730,6 +753,7 @@ export default function App() {
         }}
         onSeekRequest={onSeekRequest}
         onSeekCommit={onSeekCommit}
+        onVolumeChange={onVolumeChange}
       />
       {ctxMenu && (
         <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>

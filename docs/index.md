@@ -115,7 +115,7 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 │          │              │  │   应用内登录 / 显示WebView│
 ├──────────┴──────────────┴──┤                       │
 │   播放控制区 controls         │                       │  ← 在列表+队列下方，不压播放器
-│   ⏮ ▶ ⏭ ━━━━━━ 0:00/0:00 🔁  │                       │
+│   ⏮ ▶ ⏭ ━━━━━━ 0:00/0:00 🔊━ 🔁│                       │
 └─────────────────────────────┴───────────────────────┘
 ```
 
@@ -140,8 +140,8 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 | `BRIDGE_INIT` 注入脚本（hook `<video>` 事件） | [webview.rs:58](../src-tauri/src/webview.rs#L58) |
 | `capture_script`（抓 `__INITIAL_STATE__`+分页+`listTitle`） | [webview.rs:132](../src-tauri/src/webview.rs#L132) |
 | `PLAY_CONTROL_HELPERS`（控制只选真正 `<video>`、跳过 `bwp-video` 自定义元素 + `readyState<1` 点 B 站按钮触发拉流 + 静音降级 + seekTo + `dbg` 诊断） | [webview.rs:352](../src-tauri/src/webview.rs#L352) |
-| `control_script`（play/pause/seek，轮询等 `<video>`） | [webview.rs:467](../src-tauri/src/webview.rs#L467) |
-| `seek_and_play_control_script`（Load 流程合并 seek+play） | [webview.rs:487](../src-tauri/src/webview.rs#L487) |
+| `control_script`（play/pause/seek/setVolume，轮询等 `<video>`；setVolume 套 `v.volume`+`v.muted=(vol<=0)`） | [webview.rs:550](../src-tauri/src/webview.rs#L550) |
+| `seek_and_play_control_script`（Load 流程合并 seek+play+volume；volume 在 seekTo 前同 tick 套用，避免新歌满音量跳变） | [webview.rs:578](../src-tauri/src/webview.rs#L578) |
 | 视频事件校验 `validate_video_event_payload` | [webview.rs:425](../src-tauri/src/webview.rs#L425) |
 | 视频事件规范化 `map_video_event` | [webview.rs:573](../src-tauri/src/webview.rs#L573) |
 | 事件路由 `register`（4 个 bili:// 监听，含 debug 诊断转发） | [webview.rs:619](../src-tauri/src/webview.rs#L619) |
@@ -152,7 +152,7 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 | 命令 `send_playback_command` | [webview.rs:772](../src-tauri/src/webview.rs#L772) |
 | 命令 `close_bilibili_webview`（hide 不销毁） | [webview.rs:840](../src-tauri/src/webview.rs#L840) |
 | 命令 `set_bili_webview_bounds`（show/hide 真相源） | [webview.rs:851](../src-tauri/src/webview.rs#L851) |
-| `CaptureState`（current_url/pending_capture/pending_seek/pending_play/last_bounds） | [webview.rs:426](../src-tauri/src/webview.rs#L426) |
+| `CaptureState`（current_url/pending_capture/pending_seek/pending_play/pending_playback_url/pending_volume/last_bounds） | [webview.rs:628](../src-tauri/src/webview.rs#L628) |
 | URL 校验/规范化 `validate_list_url` | [parser.rs:36](../src-tauri/src/parser.rs#L36) |
 | 视频 id 规范化 `normalize_video_id` | [parser.rs:62](../src-tauri/src/parser.rs#L62) |
 | 列表 HTML 解析 `parse_list_html` | [parser.rs:90](../src-tauri/src/parser.rs#L90) |
@@ -189,7 +189,7 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 | 前端 URL 预检 | [bilibiliParser.ts:7](../src/services/bilibiliParser.ts#L7) `validateListUrl` |
 | 前端 DTO（镜像 Rust） | [types/playlist.ts](../src/types/playlist.ts) |
 | 队列组件 | [PlaylistQueue.tsx](../src/components/PlaylistQueue.tsx) |
-| 控制栏组件（图标） | [PlaybackControls.tsx](../src/components/PlaybackControls.tsx) |
+| 控制栏组件（图标 + 进度条 + 音量条） | [PlaybackControls.tsx](../src/components/PlaybackControls.tsx) |
 | grid 布局 + 各区域样式 | [styles.css](../src/styles.css) `.app-shell` |
 
 ## 6. IPC 契约（命令 / 事件）
@@ -204,7 +204,7 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 | `open_bilibili_webview` | `{url?}` | 创建/显示子 webview，可选 navigate |
 | `navigate_bilibili_webview` | `{url}` | 导航（**不 show**） |
 | `capture_list_html` | `{sourceUrl, requestId}` | 抓列表页 HTML |
-| `send_playback_command` | `{command}` | load/play/pause/seek/next/prev |
+| `send_playback_command` | `{command}` | load/play/pause/seek/next/prev/setVolume（setVolume 存 pending_volume 供切歌复用 + 即时套当前页） |
 | `close_bilibili_webview` | — | hide（不销毁，保登录态） |
 | `set_bili_webview_bounds` | `{x,y,width,height}` | 校准位置/尺寸；0=隐藏（**可见性真相源**） |
 

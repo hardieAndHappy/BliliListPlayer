@@ -142,4 +142,8 @@ pub enum PlaybackCommandDto {
         #[serde(rename = "positionSeconds", alias = "position_seconds")]
         position_seconds: f64,
     },
+    SetVolume {
+        #[serde(rename = "volume", alias = "volume")]
+        volume: f64,
+    },
 }

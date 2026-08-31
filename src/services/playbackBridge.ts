@@ -4,7 +4,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 export type PlaybackCommand =
   | { type: 'load'; url: string; positionSeconds: number }
   | { type: 'play' | 'pause' | 'next' | 'previous' }
-  | { type: 'seek'; positionSeconds: number };
+  | { type: 'seek'; positionSeconds: number }
+  | { type: 'setVolume'; volume: number };
 
 export type PlaybackEvent =
   | { type: 'started' | 'ended' | 'paused'; itemId: string; positionSeconds: number }
