@@ -40,8 +40,8 @@ export function PlaybackControls({ playing, mode, positionSeconds, durationSecon
   const max = durationSeconds > 0 ? durationSeconds : 0;
   const value = Math.min(positionSeconds, max);
   const pendingSeekRef = useRef<number | null>(null);
-  // 静音切换的记忆：拖到非零时持续更新，切回静音再恢复时取此值。
-  const lastVolumeRef = useRef(1);
+  // 静音切换的记忆：拖到非零时持续更新，切回静音再恢复时取此值。默认 0.5 与全局默认音量一致。
+  const lastVolumeRef = useRef(0.5);
   useEffect(() => { if (volume > 0) lastVolumeRef.current = volume; }, [volume]);
   const toggleMute = () => {
     if (volume > 0) { lastVolumeRef.current = volume; onVolumeChange(0); }

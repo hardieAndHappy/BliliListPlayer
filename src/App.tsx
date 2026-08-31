@@ -61,10 +61,10 @@ export default function App() {
     const saved = Number(localStorage.getItem('queueWidth'));
     return saved > 0 ? saved : 560;
   });
-  // 全局音量（0–1），持久到 localStorage 跨会话保留；默认满音量。
+  // 全局音量（0–1），持久到 localStorage 跨会话保留；默认 50%（未设置过的用户起步即半音量）。
   const [volume, setVolume] = useState<number>(() => {
     const saved = Number(localStorage.getItem('volume'));
-    return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 1;
+    return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 0.5;
   });
   const volumeRef = useRef(volume);
   useEffect(() => { volumeRef.current = volume; }, [volume]);
