@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { PlaybackControls } from './components/PlaybackControls';
 import { PlaylistQueue } from './components/PlaylistQueue';
 import { validateListUrl } from './services/bilibiliParser';
@@ -333,6 +333,32 @@ export default function App() {
       .catch((error) => setNotice(`音量同步失败：${String(error)}`));
   }, []);
 
+  // 托盘右键菜单动作（Rust emit）→ 复用现有播放 handler。handler 在 effect 之后定义且每次渲染
+  // 重建，故用 ref 持最新引用，监听器只挂一次。窗口隐藏时也能切歌/暂停/改模式（后台播放）。
+  const trayHandlersRef = useRef<{ prev: () => void; next: () => void; toggle: () => void; mode: (m: PlaylistDocument['playlists'][number]['playback']['mode']) => void }>({ prev: () => {}, next: () => {}, toggle: () => {}, mode: () => {} });
+  useEffect(() => { trayHandlersRef.current = { prev: goPrevious, next: () => goNext(), toggle: onToggle, mode: applyMode }; });
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let unsubscribe: UnlistenFn | undefined;
+    listen<{ action: string; mode?: string }>('bilibili://tray-action', (event) => {
+      const { action, mode } = event.payload;
+      switch (action) {
+        case 'prev': trayHandlersRef.current.prev(); break;
+        case 'next': trayHandlersRef.current.next(); break;
+        case 'toggle-play': trayHandlersRef.current.toggle(); break;
+        case 'mode': if (mode) trayHandlersRef.current.mode(mode as PlaylistDocument['playlists'][number]['playback']['mode']); break;
+      }
+    }).then((un) => { unsubscribe = un; });
+    return () => { unsubscribe?.(); };
+  }, []);
+
+  // 模式变更 → emit tray-mode 给 Rust 更新托盘勾选。覆盖初始载入、主界面按钮、托盘点击
+  // 所有路径（都经 setMode → mode 变 → 此 effect 触发）。单一同步点，Rust 不持模式状态。
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    void emit('bilibili://tray-mode', { mode }).catch((error) => setNotice(`托盘模式同步失败：${String(error)}`));
+  }, [mode]);
+
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
     let unsubscribe: UnlistenFn | undefined;
@@ -644,6 +670,15 @@ export default function App() {
   };
 
   const onToggle = () => sendCommand(playback.playing ? { type: 'pause' } : { type: 'play' });
+  // 切换播放模式：setMode + 若当前选中列表正是正在播放列表，同步 playingModeRef（供上下首
+  // 算法用最新模式）。主界面模式按钮与托盘菜单都走此 helper，单一入口。模式变更的托盘勾选
+  // 同步由下方 mode effect 统一 emit tray-mode 给 Rust，无需在此手动推。
+  const applyMode = (nextMode: PlaylistDocument['playlists'][number]['playback']['mode']) => {
+    setMode(nextMode);
+    if (activePlaylistId === playingPlaylistIdRef.current) {
+      playingModeRef.current = nextMode;
+    }
+  };
   // 音量即时下发（setVolume 是廉价 eval），并持久化；跨切歌保留由后端 pending_volume 负责。
   const onVolumeChange = (v: number) => {
     const clamped = Math.min(Math.max(v, 0), 1);
@@ -745,12 +780,7 @@ export default function App() {
         onToggle={onToggle}
         onPrevious={goPrevious}
         onNext={() => goNext()}
-        onMode={(nextMode) => {
-          setMode(nextMode);
-          if (activePlaylistId === playingPlaylistIdRef.current) {
-            playingModeRef.current = nextMode;
-          }
-        }}
+        onMode={(nextMode) => applyMode(nextMode)}
         onSeekRequest={onSeekRequest}
         onSeekCommit={onSeekCommit}
         onVolumeChange={onVolumeChange}

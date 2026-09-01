@@ -718,6 +718,21 @@ struct PageStatePayload {
     login_state: String, // "ready" | "verification-required"
 }
 
+/// 更新托盘「播放/暂停」菜单项文本：play→「暂停」、pause→「播放」。其它事件类型跳过。
+/// 句柄在 lib.rs setup 存进 TrayMenuState；webview::register 的 video-event 监听器调用此函数。
+fn update_play_pause_label(app: &AppHandle, event_type: &str) {
+    let text = match event_type {
+        "play" => "暂停",
+        "pause" => "播放",
+        _ => return,
+    };
+    let state = app.state::<crate::TrayMenuState>();
+    let guard = state.play_pause.lock().unwrap();
+    if let Some(item) = guard.as_ref() {
+        let _ = item.set_text(text);
+    }
+}
+
 pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let app_v = app.clone();
     app.listen("bili://video-event", move |event| {
@@ -730,8 +745,38 @@ pub fn register(app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send 
             return;
         };
         let item_id = parser::normalize_video_id(&parsed.item_id).unwrap_or_else(|| parsed.item_id.clone());
+        // 托盘「播放/暂停」标签态反映：Rust 本就映射此事件，按 play/pause 改菜单项文本
+        //（play→「暂停」、pause→「播放」）。零额外通道，与前端 playback.playing 同源。
+        update_play_pause_label(&app_v, &parsed.event_type);
         if let Some(typed) = map_video_event(parsed, item_id) {
             let _ = app_v.emit_to("main", "bilibili://playback-event", typed);
+        }
+    });
+
+    // 前端模式变更回传：更新托盘 4 个模式勾选项，当前模式打勾、其余取消。模式真相源在
+    // 前端，Rust 不持有，故由前端 emit（初始载入、主界面按钮、托盘点击所有路径都经此同步）。
+    let app_tm = app.clone();
+    app.listen("bilibili://tray-mode", move |event| {
+        let value: serde_json::Value = match serde_json::from_str(event.payload()) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let Some(mode) = value.get("mode").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let target = match mode {
+            "ordered" => "mode-ordered",
+            "list-loop" => "mode-list-loop",
+            "single-loop" => "mode-single-loop",
+            "random" => "mode-random",
+            _ => return,
+        };
+        let state = app_tm.state::<crate::TrayMenuState>();
+        let guard = state.modes.lock().unwrap();
+        if let Some(modes) = guard.as_ref() {
+            for (&id, item) in modes.iter() {
+                let _ = item.set_checked(id == target);
+            }
         }
     });
 

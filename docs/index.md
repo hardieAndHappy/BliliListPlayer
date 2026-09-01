@@ -5,7 +5,7 @@
 
 ## 1. 这是什么
 
-Windows 桌面应用，本地管理 Bilibili 视频列表：**窗口内嵌入 WebView 在线播放** + **本地列表编辑/排序/循环/随机**。明确**不下载媒体**——只读 `currentTime`/`duration`/`outerHTML`，从不读 `src`/`currentSrc`/`cookie`。
+Windows 桌面应用，本地管理 Bilibili 视频列表：**窗口内嵌入 WebView 在线播放** + **本地列表编辑/排序/循环/随机**。明确**不下载媒体**——只读 `currentTime`/`duration`/`outerHTML`，从不读 `src`/`currentSrc`/`cookie`。关闭主窗口**最小化到系统托盘**（后台继续播放），托盘右键菜单控制播放/模式/退出，左键托盘唤起窗口。
 
 | 层 | 技术 | 版本 |
 |---|---|---|
@@ -218,6 +218,13 @@ Chrome Cookie，也不要求安装浏览器扩展。此前的
 | `bili://debug` | `bilibili://debug` | [App.tsx](../src/App.tsx)（`console.warn` 到主 devtools；播放控制流程诊断，修复后可移除） |
 
 **Rust → 前端（窗口事件）**：`bilibili://window-resized`（[lib.rs:79](../src-tauri/src/lib.rs#L79)）→ [App.tsx:203](../src/App.tsx#L203) 重测 bounds。
+
+**托盘事件**（Rust ↔ 前端，复用现有播放 handler）：
+
+| 事件 | 方向 | 作用 |
+|---|---|---|
+| `bilibili://tray-action` | Rust → 前端 | 托盘右键菜单动作 `{action: prev/next/toggle-play/mode, mode?}` → [App.tsx](../src/App.tsx) 复用 `goPrevious/goNext/onToggle/applyMode` |
+| `bilibili://tray-mode` | 前端 → Rust | 模式变更回传 `{mode}` → Rust 更新托盘 4 模式勾选（[webview.rs](../src-tauri/src/webview.rs) `register` 监听） |
 
 ## 7. 数据模型
 
